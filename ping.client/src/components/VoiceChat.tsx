@@ -23,24 +23,137 @@ function base64ToU8(b64: string): Uint8Array {
     return u8;
 }
 
+// PCM helpers
+function float32ToInt16PCM(f32: Float32Array): Uint8Array {
+    const out = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+        const s = Math.max(-1, Math.min(1, f32[i]));
+        out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    return new Uint8Array(out.buffer);
+}
+function int16ToFloat32PCM(u8: Uint8Array): Float32Array {
+    const i16 = new Int16Array(u8.buffer, u8.byteOffset, Math.floor(u8.byteLength / 2));
+    const f32 = new Float32Array(i16.length);
+    for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 0x8000;
+    return f32;
+}
+type PcmFormat = { bits: number, rate: number, channels: number };
+function buildPcmMime(fmt: PcmFormat): string {
+    return `audio/pcm;bits=${fmt.bits};rate=${fmt.rate};channels=${fmt.channels}`;
+}
+function parsePcmMime(m?: string): PcmFormat | null {
+    if (!m) return null;
+    const lm = m.toLowerCase();
+    if (!lm.startsWith('audio/pcm')) return null;
+    const parts = lm.split(';').slice(1).map(p => p.trim());
+    const fmt: Partial<PcmFormat> = {};
+    for (const p of parts) {
+        const [k, v] = p.split('=').map(s => s.trim());
+        if (k === 'bits') fmt.bits = Number(v);
+        if (k === 'rate') fmt.rate = Number(v);
+        if (k === 'channels') fmt.channels = Number(v);
+    }
+    const bits = fmt.bits ?? 16;
+    const rate = fmt.rate ?? 48000;
+    const channels = fmt.channels ?? 1;
+    if (![8, 16].includes(bits) || !rate || !channels) return null;
+    return { bits, rate, channels };
+}
+
 export default function VoiceChat() {
     const [status, setStatus] = useState<Status>('idle');
     const [name, setName] = useState('Guest');
 
-    const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-    const chunksRef = useRef<Blob[]>([]);
     const connectionRef = useRef<signalR.HubConnection | null>(null);
     const startingRef = useRef(false);
+    const nameRef = useRef(name);
+
+    // WebAudio state (send + receive)
+    const audioCtxRef = useRef<AudioContext | null>(null);
+
+    // Sender nodes
+    const sendStreamRef = useRef<MediaStream | null>(null);
+    const sendSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+    const sendProcessorRef = useRef<ScriptProcessorNode | null>(null);
+
+    // Receiver scheduling
+    const nextStartTimeRef = useRef<number>(0);
+    const scheduleChainRef = useRef<Promise<void>>(Promise.resolve());
+    const lastChunkAtRef = useRef<number>(0);
+
+    useEffect(() => {
+        nameRef.current = name;
+    }, [name]);
 
     useEffect(() => {
         navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => { });
     }, []);
 
+    const ensureAudioContext = useCallback(async () => {
+        if (!audioCtxRef.current) {
+            audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+        }
+        if (audioCtxRef.current.state !== 'running') {
+            try { await audioCtxRef.current.resume(); } catch { /* ignore */ }
+        }
+        return audioCtxRef.current;
+    }, []);
+
+    const resetSchedulingIfIdle = useCallback(() => {
+        const now = performance.now();
+        if (now - lastChunkAtRef.current > 1500) {
+            const ctx = audioCtxRef.current;
+            nextStartTimeRef.current = ctx ? ctx.currentTime : 0;
+        }
+    }, []);
+
+    // Schedule already-decoded PCM into AudioContext
+    const schedulePcm = useCallback(async (pcm: Float32Array, fmt: PcmFormat) => {
+        const ctx = await ensureAudioContext();
+
+        // Create buffer with sender's sampleRate so Web Audio will resample if needed
+        const buf = ctx.createBuffer(fmt.channels, pcm.length, fmt.rate);
+
+        if (fmt.channels === 1) {
+            buf.copyToChannel(pcm, 0);
+        } else {
+            // If we ever send interleaved multi-channel, split here (current sender is mono)
+            buf.copyToChannel(pcm, 0);
+        }
+
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
+
+        const ahead = 0.03; // small headroom for jitter
+        const startAt = Math.max(nextStartTimeRef.current, ctx.currentTime + ahead);
+        src.start(startAt);
+        nextStartTimeRef.current = startAt + buf.duration;
+
+        src.onended = () => {
+            if (nextStartTimeRef.current < ctx.currentTime) {
+                nextStartTimeRef.current = ctx.currentTime;
+            }
+        };
+    }, [ensureAudioContext]);
+
+    const enqueuePcm = useCallback((pcm: Float32Array, fmt: PcmFormat) => {
+        lastChunkAtRef.current = performance.now();
+        resetSchedulingIfIdle();
+        scheduleChainRef.current = scheduleChainRef.current
+            .then(() => schedulePcm(pcm, fmt))
+            .catch((e) => {
+                console.error('Schedule failed', e);
+                const ctx = audioCtxRef.current;
+                nextStartTimeRef.current = ctx ? ctx.currentTime : 0;
+            });
+    }, [schedulePcm, resetSchedulingIfIdle]);
+
     useEffect(() => {
         if (!connectionRef.current) {
             connectionRef.current = new signalR.HubConnectionBuilder()
                 .withUrl(HUB_URL, {
-                    // Dev-friendly: avoid negotiation entirely
                     transport: signalR.HttpTransportType.WebSockets,
                     skipNegotiation: true,
                     withCredentials: true,
@@ -48,26 +161,35 @@ export default function VoiceChat() {
                 .withAutomaticReconnect()
                 .build();
 
-            // Incoming audio (server sends base64 for byte[] under JSON)
-            connectionRef.current.on('VoiceNote', (data: unknown, mimeType: string) => {
+            connectionRef.current.on('VoiceNote', async (data: unknown, mimeType: string) => {
                 try {
+                    const fmt = parsePcmMime(mimeType);
                     let u8: Uint8Array | undefined;
                     if (typeof data === 'string') u8 = base64ToU8(data);
                     else if (Array.isArray(data)) u8 = new Uint8Array(data as number[]);
                     else if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
-                    if (!u8) return;
+                    if (!u8 || u8.length === 0) return;
 
-                    const blob = new Blob([u8], { type: mimeType || 'audio/webm' });
-                    const url = URL.createObjectURL(blob);
-                    const audio = new Audio(url);
-                    audio.play().finally(() => URL.revokeObjectURL(url));
+                    if (fmt && fmt.bits === 16) {
+                        // Our PCM16 mono stream
+                        const f32 = int16ToFloat32PCM(u8);
+                        enqueuePcm(f32, fmt);
+                        return;
+                    }
+
+                    // Fallback: ignore non-PCM chunks (old clients). You can add decodeAudioData fallback if desired.
+                    // console.warn('Unsupported mimeType for streaming chunk:', mimeType);
                 } catch (err) {
-                    console.error('Failed to play incoming audio', err);
+                    console.error('Failed to handle incoming audio', err);
                 }
             });
 
             connectionRef.current.onreconnecting(() => setStatus('connecting'));
-            connectionRef.current.onreconnected(() => setStatus('connected'));
+            connectionRef.current.onreconnected(() => {
+                setStatus('connected');
+                const ctx = audioCtxRef.current;
+                nextStartTimeRef.current = ctx ? ctx.currentTime : 0;
+            });
             connectionRef.current.onclose(() => setStatus('idle'));
         }
 
@@ -88,9 +210,7 @@ export default function VoiceChat() {
                 }
             } catch (err: any) {
                 const msg = String(err?.message || err);
-                // Ignore aborts from StrictMode first mount
                 if (msg.toLowerCase().includes('stopped during negotiation')) {
-                    // Retry shortly
                     startingRef.current = false;
                     if (!disposed) start(200);
                     return;
@@ -102,90 +222,99 @@ export default function VoiceChat() {
             }
         };
 
-        // Defer start to avoid StrictMode first-pass cleanup races
         setTimeout(() => start(), 0);
 
         return () => {
             disposed = true;
-            // Stop only if actually connected/connecting
             const c = connectionRef.current;
             if (c && c.state !== signalR.HubConnectionState.Disconnected) {
                 c.stop().catch(() => { });
             }
+            try { audioCtxRef.current?.close(); } catch { /* ignore */ }
+            audioCtxRef.current = null;
+            nextStartTimeRef.current = 0;
+            scheduleChainRef.current = Promise.resolve();
         };
-    }, []);
+    }, [enqueuePcm]);
 
     const startRecording = useCallback(async () => {
         if (status !== 'connected') return;
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const ctx = await ensureAudioContext();
 
-            const preferred = [
-                'audio/webm;codecs=opus',
-                'audio/webm',
-                'audio/ogg;codecs=opus',
-                'audio/ogg',
-            ];
-            const mimeType = preferred.find((t) => MediaRecorder.isTypeSupported(t)) ?? '';
+            // Create nodes
+            const source = ctx.createMediaStreamSource(stream);
 
-            const mr = new MediaRecorder(stream, {
-                ...(mimeType ? { mimeType } : {}),
-                audioBitsPerSecond: 64000,
-            });
+            // ScriptProcessor fallback (works in all major browsers though deprecated)
+            const bufferSize = 2048; // ~43ms @ 48kHz. Tweak for latency vs CPU
+            const channels = Math.min(source.channelCount || 1, 2); // capture up to stereo, downmix to mono
+            const processor = ctx.createScriptProcessor(bufferSize, channels, 1);
+            // Keep the node graph alive
+            source.connect(processor);
+            processor.connect(ctx.destination);
 
-            chunksRef.current = [];
-            mr.ondataavailable = (e) => e.data && e.data.size > 0 && chunksRef.current.push(e.data);
-            mr.onstop = () => {
+            const fmt: PcmFormat = { bits: 16, rate: ctx.sampleRate, channels: 1 };
+
+            processor.onaudioprocess = (e) => {
                 try {
-                    stream.getTracks().forEach((t) => t.stop());
-                } catch { }
+                    // Downmix to mono Float32
+                    const inCh0 = e.inputBuffer.getChannelData(0);
+                    const len = inCh0.length;
+                    let mono: Float32Array;
+
+                    if (channels === 1) {
+                        // Copy to avoid reusing internal buffers
+                        mono = new Float32Array(len);
+                        mono.set(inCh0);
+                    } else {
+                        // Average channels 0 and 1
+                        const inCh1 = e.inputBuffer.getChannelData(1);
+                        mono = new Float32Array(len);
+                        for (let i = 0; i < len; i++) {
+                            mono[i] = (inCh0[i] + inCh1[i]) * 0.5;
+                        }
+                    }
+
+                    const u8 = float32ToInt16PCM(mono);
+                    const b64 = u8ToBase64(u8);
+                    connectionRef.current?.invoke('SendVoiceNote', b64, buildPcmMime(fmt), nameRef.current)
+                        .catch((err) => console.error('Failed to send PCM chunk', err));
+                } catch (err) {
+                    console.error('PCM capture/sent failed', err);
+                }
             };
 
-            mr.start();
-            mediaRecorderRef.current = mr;
+            sendStreamRef.current = stream;
+            sendSourceRef.current = source;
+            sendProcessorRef.current = processor;
+
             setStatus('recording');
         } catch {
             alert('Microphone permission is required.');
         }
-    }, [status]);
+    }, [status, ensureAudioContext]);
 
-    const stopAndSend = useCallback(async () => {
-        const mr = mediaRecorderRef.current;
-        if (!mr) return;
+    const stopRecording = useCallback(async () => {
+        const proc = sendProcessorRef.current;
+        const src = sendSourceRef.current;
+        const stream = sendStreamRef.current;
 
-        await new Promise<void>((resolve) => {
-            const done = () => resolve();
-            mr.addEventListener('stop', done, { once: true });
-            try {
-                mr.stop();
-            } catch {
-                resolve();
-            }
-        });
-
-        const mime = mr.mimeType || 'audio/webm';
-        const blob = new Blob(chunksRef.current, { type: mime });
-
-        mediaRecorderRef.current = null;
-        chunksRef.current = [];
-
-        if (blob.size > 2 * 1024 * 1024) {
-            alert('Clip too large (>2 MB). Try a shorter press.');
-            setStatus('connected');
-            return;
+        if (proc) {
+            try { proc.disconnect(); } catch { }
+            sendProcessorRef.current = null;
+        }
+        if (src) {
+            try { src.disconnect(); } catch { }
+            sendSourceRef.current = null;
+        }
+        if (stream) {
+            try { stream.getTracks().forEach(t => t.stop()); } catch { }
+            sendStreamRef.current = null;
         }
 
-        try {
-            const u8 = new Uint8Array(await blob.arrayBuffer());
-            const b64 = u8ToBase64(u8); // JSON: send base64 so server binds to byte[]
-            await connectionRef.current?.invoke('SendVoiceNote', b64, blob.type, name);
-        } catch (err) {
-            console.error('Failed to send voice note', err);
-            alert('Failed to send voice note.');
-        } finally {
-            setStatus('connected');
-        }
-    }, [name]);
+        setStatus('connected');
+    }, []);
 
     const handlePointerDown = useCallback((e: React.PointerEvent<HTMLButtonElement>) => {
         e.preventDefault();
@@ -194,8 +323,8 @@ export default function VoiceChat() {
 
     const handlePointerUpOrCancel = useCallback((e: React.PointerEvent<HTMLButtonElement>) => {
         e.preventDefault();
-        if (status === 'recording') stopAndSend();
-    }, [status, stopAndSend]);
+        if (status === 'recording') stopRecording();
+    }, [status, stopRecording]);
 
     return (
         <div style={{ display: 'grid', gap: 12, maxWidth: 420 }}>
@@ -222,14 +351,14 @@ export default function VoiceChat() {
                 }}
                 aria-pressed={status === 'recording'}
             >
-                {status === 'recording' ? 'Release to Send'
+                {status === 'recording' ? 'Release to Stop'
                     : status === 'connecting' ? 'Connecting…'
                         : status === 'idle' ? 'Connect to Server…'
                             : 'Hold to Talk'}
             </button>
 
             <small style={{ color: '#666' }}>
-                Clips are sent to the server and broadcast to all connected clients. No storage, no auth.
+                Streaming live while held. Sends PCM16 frames and schedules them for gapless playback.
             </small>
         </div>
     );
