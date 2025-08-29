@@ -82,6 +82,10 @@ export default function VoiceChat() {
     const scheduleChainRef = useRef<Promise<void>>(Promise.resolve());
     const lastChunkAtRef = useRef<number>(0);
 
+    // UI: who is currently talking (other users)
+    const [activeSpeaker, setActiveSpeaker] = useState<string | null>(null);
+    const clearSpeakerTimerRef = useRef<number | null>(null);
+
     useEffect(() => { nameRef.current = name; }, [name]);
 
     useEffect(() => {
@@ -141,12 +145,21 @@ export default function VoiceChat() {
                     skipNegotiation: true,
                     withCredentials: true,
                 })
-                .withHubProtocol(new MessagePackHubProtocol()) // <-- MessagePack
+                .withHubProtocol(new MessagePackHubProtocol()) // MessagePack
                 .withAutomaticReconnect()
                 .build();
 
-            connectionRef.current.on('VoiceNote', async (data: unknown, mimeType: string) => {
+            // Note: server sends (data, mimeType, sender, timestamp)
+            connectionRef.current.on('VoiceNote', async (data: unknown, mimeType: string, sender?: string) => {
                 try {
+                    // UI: show who is speaking (other users only)
+                    if (sender && typeof sender === 'string') {
+                        setActiveSpeaker(sender);
+                        if (clearSpeakerTimerRef.current) clearTimeout(clearSpeakerTimerRef.current);
+                        // Hide after brief silence; chunks arrive ~every 40–50ms
+                        clearSpeakerTimerRef.current = window.setTimeout(() => setActiveSpeaker(null), 400);
+                    }
+
                     const fmt = parsePcmMime(mimeType);
                     let u8: Uint8Array | undefined;
 
@@ -220,6 +233,11 @@ export default function VoiceChat() {
             audioCtxRef.current = null;
             nextStartTimeRef.current = 0;
             scheduleChainRef.current = Promise.resolve();
+
+            if (clearSpeakerTimerRef.current) {
+                clearTimeout(clearSpeakerTimerRef.current);
+                clearSpeakerTimerRef.current = null;
+            }
         };
     }, [enqueuePcm]);
 
@@ -298,6 +316,31 @@ export default function VoiceChat() {
         <div style={{ display: 'grid', gap: 12, maxWidth: 420 }}>
             <h2>Push-to-Talk (PoC)</h2>
 
+            {/* Speaking indicator */}
+            {activeSpeaker && (
+                <div
+                    role="status"
+                    aria-live="polite"
+                    style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        padding: '6px 10px',
+                        borderRadius: 999,
+                        background: '#eef6ff',
+                        color: '#0b5cab',
+                        width: 'fit-content'
+                    }}
+                    title="Someone is talking"
+                >
+                    <span style={{
+                        width: 8, height: 8, borderRadius: 999, background: '#2ecc71',
+                        boxShadow: '0 0 0 3px rgba(46,204,113,0.25)'
+                    }} />
+                    <span>{activeSpeaker} is talking…</span>
+                </div>
+            )}
+
             <label style={{ display: 'grid', gap: 6 }}>
                 <span>Your name</span>
                 <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Guest" />
@@ -315,6 +358,7 @@ export default function VoiceChat() {
                     borderRadius: 12,
                     cursor: status === 'connecting' || status === 'idle' ? 'not-allowed' : 'pointer',
                     background: status === 'recording' ? 'black' : 'black',
+                    color: 'white',
                     border: '1px solid',
                 }}
                 aria-pressed={status === 'recording'}
@@ -328,7 +372,6 @@ export default function VoiceChat() {
             <small style={{ color: '#666' }}>
                 Streaming live while held. Sends PCM16 frames and schedules them for gapless playback.
             </small>
-            {/* ... UI unchanged ... */}
         </div>
     );
 }
