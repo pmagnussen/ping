@@ -1,9 +1,9 @@
 ﻿import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as signalR from '@microsoft/signalr';
+import { MessagePackHubProtocol } from '@microsoft/signalr-protocol-msgpack';
 
 type Status = 'idle' | 'connecting' | 'connected' | 'recording';
 
-// Use relative URL to work with both backend hosting and Vite proxy
 const HUB_URL = 'https://localhost:7160/voice';
 
 // Helpers for base64 <-> Uint8Array (JSON protocol encodes byte[] as base64)
@@ -82,9 +82,7 @@ export default function VoiceChat() {
     const scheduleChainRef = useRef<Promise<void>>(Promise.resolve());
     const lastChunkAtRef = useRef<number>(0);
 
-    useEffect(() => {
-        nameRef.current = name;
-    }, [name]);
+    useEffect(() => { nameRef.current = name; }, [name]);
 
     useEffect(() => {
         navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => { });
@@ -95,7 +93,7 @@ export default function VoiceChat() {
             audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
         }
         if (audioCtxRef.current.state !== 'running') {
-            try { await audioCtxRef.current.resume(); } catch { /* ignore */ }
+            try { await audioCtxRef.current.resume(); } catch { }
         }
         return audioCtxRef.current;
     }, []);
@@ -108,43 +106,28 @@ export default function VoiceChat() {
         }
     }, []);
 
-    // Schedule already-decoded PCM into AudioContext
-    const schedulePcm = useCallback(async (pcm: Float32Array, fmt: PcmFormat) => {
+    const schedulePcm = useCallback(async (pcm: Float32Array, fmt: { bits: number, rate: number, channels: number }) => {
         const ctx = await ensureAudioContext();
-
-        // Create buffer with sender's sampleRate so Web Audio will resample if needed
         const buf = ctx.createBuffer(fmt.channels, pcm.length, fmt.rate);
-
-        if (fmt.channels === 1) {
-            buf.copyToChannel(pcm, 0);
-        } else {
-            // If we ever send interleaved multi-channel, split here (current sender is mono)
-            buf.copyToChannel(pcm, 0);
-        }
-
+        buf.copyToChannel(pcm, 0);
         const src = ctx.createBufferSource();
         src.buffer = buf;
         src.connect(ctx.destination);
-
-        const ahead = 0.03; // small headroom for jitter
+        const ahead = 0.03;
         const startAt = Math.max(nextStartTimeRef.current, ctx.currentTime + ahead);
         src.start(startAt);
         nextStartTimeRef.current = startAt + buf.duration;
-
         src.onended = () => {
-            if (nextStartTimeRef.current < ctx.currentTime) {
-                nextStartTimeRef.current = ctx.currentTime;
-            }
+            if (nextStartTimeRef.current < ctx.currentTime) nextStartTimeRef.current = ctx.currentTime;
         };
     }, [ensureAudioContext]);
 
-    const enqueuePcm = useCallback((pcm: Float32Array, fmt: PcmFormat) => {
+    const enqueuePcm = useCallback((pcm: Float32Array, fmt: { bits: number, rate: number, channels: number }) => {
         lastChunkAtRef.current = performance.now();
         resetSchedulingIfIdle();
         scheduleChainRef.current = scheduleChainRef.current
             .then(() => schedulePcm(pcm, fmt))
-            .catch((e) => {
-                console.error('Schedule failed', e);
+            .catch(() => {
                 const ctx = audioCtxRef.current;
                 nextStartTimeRef.current = ctx ? ctx.currentTime : 0;
             });
@@ -158,6 +141,7 @@ export default function VoiceChat() {
                     skipNegotiation: true,
                     withCredentials: true,
                 })
+                .withHubProtocol(new MessagePackHubProtocol()) // <-- MessagePack
                 .withAutomaticReconnect()
                 .build();
 
@@ -165,20 +149,22 @@ export default function VoiceChat() {
                 try {
                     const fmt = parsePcmMime(mimeType);
                     let u8: Uint8Array | undefined;
-                    if (typeof data === 'string') u8 = base64ToU8(data);
-                    else if (Array.isArray(data)) u8 = new Uint8Array(data as number[]);
-                    else if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
-                    if (!u8 || u8.length === 0) return;
 
-                    if (fmt && fmt.bits === 16) {
-                        // Our PCM16 mono stream
-                        const f32 = int16ToFloat32PCM(u8);
-                        enqueuePcm(f32, fmt);
-                        return;
+                    if (data instanceof Uint8Array) u8 = data;
+                    else if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
+                    else if (Array.isArray(data)) u8 = new Uint8Array(data as number[]);
+                    else if (typeof data === 'string') {
+                        // Fallback: legacy JSON base64
+                        const bin = atob(data);
+                        const tmp = new Uint8Array(bin.length);
+                        for (let i = 0; i < bin.length; i++) tmp[i] = bin.charCodeAt(i);
+                        u8 = tmp;
                     }
 
-                    // Fallback: ignore non-PCM chunks (old clients). You can add decodeAudioData fallback if desired.
-                    // console.warn('Unsupported mimeType for streaming chunk:', mimeType);
+                    if (!u8 || u8.length === 0 || !fmt || fmt.bits !== 16) return;
+
+                    const f32 = int16ToFloat32PCM(u8);
+                    enqueuePcm(f32, fmt);
                 } catch (err) {
                     console.error('Failed to handle incoming audio', err);
                 }
@@ -230,7 +216,7 @@ export default function VoiceChat() {
             if (c && c.state !== signalR.HubConnectionState.Disconnected) {
                 c.stop().catch(() => { });
             }
-            try { audioCtxRef.current?.close(); } catch { /* ignore */ }
+            try { audioCtxRef.current?.close(); } catch { }
             audioCtxRef.current = null;
             nextStartTimeRef.current = 0;
             scheduleChainRef.current = Promise.resolve();
@@ -240,48 +226,39 @@ export default function VoiceChat() {
     const startRecording = useCallback(async () => {
         if (status !== 'connected') return;
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
             const ctx = await ensureAudioContext();
 
-            // Create nodes
             const source = ctx.createMediaStreamSource(stream);
-
-            // ScriptProcessor fallback (works in all major browsers though deprecated)
-            const bufferSize = 2048; // ~43ms @ 48kHz. Tweak for latency vs CPU
-            const channels = Math.min(source.channelCount || 1, 2); // capture up to stereo, downmix to mono
+            const bufferSize = 2048;
+            const channels = Math.min(source.channelCount || 1, 2);
             const processor = ctx.createScriptProcessor(bufferSize, channels, 1);
-            // Keep the node graph alive
             source.connect(processor);
             processor.connect(ctx.destination);
 
-            const fmt: PcmFormat = { bits: 16, rate: ctx.sampleRate, channels: 1 };
+            const fmt = { bits: 16, rate: ctx.sampleRate, channels: 1 as const };
 
             processor.onaudioprocess = (e) => {
                 try {
-                    // Downmix to mono Float32
                     const inCh0 = e.inputBuffer.getChannelData(0);
                     const len = inCh0.length;
                     let mono: Float32Array;
 
                     if (channels === 1) {
-                        // Copy to avoid reusing internal buffers
                         mono = new Float32Array(len);
                         mono.set(inCh0);
                     } else {
-                        // Average channels 0 and 1
                         const inCh1 = e.inputBuffer.getChannelData(1);
                         mono = new Float32Array(len);
-                        for (let i = 0; i < len; i++) {
-                            mono[i] = (inCh0[i] + inCh1[i]) * 0.5;
-                        }
+                        for (let i = 0; i < len; i++) mono[i] = (inCh0[i] + inCh1[i]) * 0.5;
                     }
 
                     const u8 = float32ToInt16PCM(mono);
-                    const b64 = u8ToBase64(u8);
-                    connectionRef.current?.invoke('SendVoiceNote', b64, buildPcmMime(fmt), nameRef.current)
+                    // Send Uint8Array directly (MessagePack binary)
+                    connectionRef.current?.invoke('SendVoiceNote', u8, buildPcmMime(fmt), nameRef.current)
                         .catch((err) => console.error('Failed to send PCM chunk', err));
                 } catch (err) {
-                    console.error('PCM capture/sent failed', err);
+                    console.error('PCM capture/send failed', err);
                 }
             };
 
@@ -300,18 +277,9 @@ export default function VoiceChat() {
         const src = sendSourceRef.current;
         const stream = sendStreamRef.current;
 
-        if (proc) {
-            try { proc.disconnect(); } catch { }
-            sendProcessorRef.current = null;
-        }
-        if (src) {
-            try { src.disconnect(); } catch { }
-            sendSourceRef.current = null;
-        }
-        if (stream) {
-            try { stream.getTracks().forEach(t => t.stop()); } catch { }
-            sendStreamRef.current = null;
-        }
+        if (proc) { try { proc.disconnect(); } catch { } sendProcessorRef.current = null; }
+        if (src) { try { src.disconnect(); } catch { } sendSourceRef.current = null; }
+        if (stream) { try { stream.getTracks().forEach(t => t.stop()); } catch { } sendStreamRef.current = null; }
 
         setStatus('connected');
     }, []);
@@ -360,6 +328,7 @@ export default function VoiceChat() {
             <small style={{ color: '#666' }}>
                 Streaming live while held. Sends PCM16 frames and schedules them for gapless playback.
             </small>
+            {/* ... UI unchanged ... */}
         </div>
     );
 }
