@@ -3,305 +3,282 @@ import * as signalR from '@microsoft/signalr';
 import { MessagePackHubProtocol } from '@microsoft/signalr-protocol-msgpack';
 
 type Status = 'idle' | 'connecting' | 'connected' | 'recording';
-
 const HUB_URL = 'https://localhost:7160/voice';
 
-// Helpers for base64 <-> Uint8Array (JSON protocol encodes byte[] as base64)
-function u8ToBase64(u8: Uint8Array): string {
-    let binary = '';
-    const chunk = 0x8000;
-    for (let i = 0; i < u8.length; i += chunk) {
-        const sub = u8.subarray(i, i + chunk);
-        binary += String.fromCharCode(...(sub as unknown as number[]));
-    }
-    return btoa(binary);
-}
-function base64ToU8(b64: string): Uint8Array {
-    const bin = atob(b64);
-    const u8 = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-    return u8;
-}
-
-// PCM helpers
-function float32ToInt16PCM(f32: Float32Array): Uint8Array {
-    const out = new Int16Array(f32.length);
-    for (let i = 0; i < f32.length; i++) {
-        const s = Math.max(-1, Math.min(1, f32[i]));
-        out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-    }
-    return new Uint8Array(out.buffer);
-}
-function int16ToFloat32PCM(u8: Uint8Array): Float32Array {
-    const i16 = new Int16Array(u8.buffer, u8.byteOffset, Math.floor(u8.byteLength / 2));
-    const f32 = new Float32Array(i16.length);
-    for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 0x8000;
-    return f32;
-}
-type PcmFormat = { bits: number, rate: number, channels: number };
-function buildPcmMime(fmt: PcmFormat): string {
-    return `audio/pcm;bits=${fmt.bits};rate=${fmt.rate};channels=${fmt.channels}`;
-}
-function parsePcmMime(m?: string): PcmFormat | null {
-    if (!m) return null;
-    const lm = m.toLowerCase();
-    if (!lm.startsWith('audio/pcm')) return null;
-    const parts = lm.split(';').slice(1).map(p => p.trim());
-    const fmt: Partial<PcmFormat> = {};
-    for (const p of parts) {
-        const [k, v] = p.split('=').map(s => s.trim());
-        if (k === 'bits') fmt.bits = Number(v);
-        if (k === 'rate') fmt.rate = Number(v);
-        if (k === 'channels') fmt.channels = Number(v);
-    }
-    const bits = fmt.bits ?? 16;
-    const rate = fmt.rate ?? 48000;
-    const channels = fmt.channels ?? 1;
-    if (![8, 16].includes(bits) || !rate || !channels) return null;
-    return { bits, rate, channels };
-}
+// Note: PascalCase to match MessagePack payload from .NET (PeerInfo.ConnectionId/Name)
+type PeerInfo = { ConnectionId: string; Name: string };
 
 export default function VoiceChat() {
     const [status, setStatus] = useState<Status>('idle');
     const [name, setName] = useState('Guest');
 
-    const connectionRef = useRef<signalR.HubConnection | null>(null);
+    // SignalR (signaling only)
+    const hubRef = useRef<signalR.HubConnection | null>(null);
     const startingRef = useRef(false);
     const nameRef = useRef(name);
 
-    // WebAudio state (send + receive)
-    const audioCtxRef = useRef<AudioContext | null>(null);
+    // WebRTC
+    const pcsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+    const peerNamesRef = useRef<Map<string, string>>(new Map());
+    const remoteAudiosRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+    const localStreamRef = useRef<MediaStream | null>(null);
+    const localTrackRef = useRef<MediaStreamTrack | null>(null);
 
-    // Sender nodes
-    const sendStreamRef = useRef<MediaStream | null>(null);
-    const sendSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-    const sendProcessorRef = useRef<ScriptProcessorNode | null>(null);
-
-    // Receiver scheduling
-    const nextStartTimeRef = useRef<number>(0);
-    const scheduleChainRef = useRef<Promise<void>>(Promise.resolve());
-    const lastChunkAtRef = useRef<number>(0);
-
-    // UI: who is currently talking (other users)
+    // UI: who is currently talking (basic indicator)
     const [activeSpeaker, setActiveSpeaker] = useState<string | null>(null);
-    const clearSpeakerTimerRef = useRef<number | null>(null);
+    const activeSpeakerTimerRef = useRef<number | null>(null);
 
     // PTT keyboard state
     const pttKeyDownRef = useRef(false);
 
     useEffect(() => { nameRef.current = name; }, [name]);
 
-    useEffect(() => {
-        navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => { });
+    // Ensure local mic track exists; disabled by default (PTT off)
+    const ensureLocalTrack = useCallback(async (): Promise<MediaStreamTrack> => {
+        if (localTrackRef.current && localStreamRef.current) return localTrackRef.current;
+        const stream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        });
+        localStreamRef.current = stream;
+        const track = stream.getAudioTracks()[0];
+        track.enabled = false;
+        localTrackRef.current = track;
+        return track;
     }, []);
 
-    const ensureAudioContext = useCallback(async () => {
-        if (!audioCtxRef.current) {
-            audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    // Add the local track to a peer connection (once)
+    const addLocalToPc = useCallback(async (pc: RTCPeerConnection) => {
+        const track = await ensureLocalTrack();
+        const has = pc.getSenders().some(s => s.track && s.track.kind === 'audio');
+        if (!has && localStreamRef.current) {
+            pc.addTrack(track, localStreamRef.current);
         }
-        if (audioCtxRef.current.state !== 'running') {
-            try { await audioCtxRef.current.resume(); } catch { }
-        }
-        return audioCtxRef.current;
-    }, []);
+    }, [ensureLocalTrack]);
 
-    const resetSchedulingIfIdle = useCallback(() => {
-        const now = performance.now();
-        if (now - lastChunkAtRef.current > 1500) {
-            const ctx = audioCtxRef.current;
-            nextStartTimeRef.current = ctx ? ctx.currentTime : 0;
-        }
-    }, []);
+    // Create a new RTCPeerConnection to a peer
+    const createPc = useCallback((peerId: string) => {
+        let pc = pcsRef.current.get(peerId);
+        if (pc) return pc;
 
-    const schedulePcm = useCallback(async (pcm: Float32Array, fmt: { bits: number, rate: number, channels: number }) => {
-        const ctx = await ensureAudioContext();
-        const buf = ctx.createBuffer(fmt.channels, pcm.length, fmt.rate);
-        buf.copyToChannel(pcm, 0);
-        const src = ctx.createBufferSource();
-        src.buffer = buf;
-        src.connect(ctx.destination);
-        const ahead = 0.03;
-        const startAt = Math.max(nextStartTimeRef.current, ctx.currentTime + ahead);
-        src.start(startAt);
-        nextStartTimeRef.current = startAt + buf.duration;
-        src.onended = () => {
-            if (nextStartTimeRef.current < ctx.currentTime) nextStartTimeRef.current = ctx.currentTime;
+        pc = new RTCPeerConnection({
+            iceServers: [
+                { urls: ['stun:stun.l.google.com:19302'] }
+                // To avoid direct P2P, configure TURN and set iceTransportPolicy: 'relay'
+            ]
+        });
+
+        pc.onicecandidate = (e) => {
+            if (e.candidate) {
+                const json = JSON.stringify(e.candidate.toJSON());
+                hubRef.current?.invoke('SendIce', peerId, json).catch(() => { });
+            }
         };
-    }, [ensureAudioContext]);
 
-    const enqueuePcm = useCallback((pcm: Float32Array, fmt: { bits: number, rate: number, channels: number }) => {
-        lastChunkAtRef.current = performance.now();
-        resetSchedulingIfIdle();
-        scheduleChainRef.current = scheduleChainRef.current
-            .then(() => schedulePcm(pcm, fmt))
-            .catch(() => {
-                const ctx = audioCtxRef.current;
-                nextStartTimeRef.current = ctx ? ctx.currentTime : 0;
-            });
-    }, [schedulePcm, resetSchedulingIfIdle]);
+        pc.ontrack = (e) => {
+            const [ms] = e.streams;
+            let el = remoteAudiosRef.current.get(peerId);
+            if (!el) {
+                el = new Audio();
+                el.autoplay = true;
+                el.playsInline = true;
+                remoteAudiosRef.current.set(peerId, el);
+            }
+            el.srcObject = ms;
+            el.play().catch(() => { /* will play after first user gesture */ });
 
-    useEffect(() => {
-        if (!connectionRef.current) {
-            connectionRef.current = new signalR.HubConnectionBuilder()
-                .withUrl(HUB_URL, {
-                    transport: signalR.HttpTransportType.WebSockets,
-                    skipNegotiation: true,
-                    withCredentials: true,
-                })
-                .withHubProtocol(new MessagePackHubProtocol()) // MessagePack
-                .withAutomaticReconnect()
-                .build();
+            // Simple talking indicator: show name briefly when media becomes active
+            const n = peerNamesRef.current.get(peerId);
+            if (n) {
+                setActiveSpeaker(n);
+                if (activeSpeakerTimerRef.current) clearTimeout(activeSpeakerTimerRef.current);
+                activeSpeakerTimerRef.current = window.setTimeout(() => setActiveSpeaker(null), 600);
+            }
+        };
 
-            // Note: server sends (data, mimeType, sender, timestamp)
-            connectionRef.current.on('VoiceNote', async (data: unknown, mimeType: string, sender?: string) => {
-                try {
-                    // UI: show who is speaking (other users only)
-                    if (sender && typeof sender === 'string') {
-                        setActiveSpeaker(sender);
-                        if (clearSpeakerTimerRef.current) clearTimeout(clearSpeakerTimerRef.current);
-                        // Hide after brief silence; chunks arrive ~every 40–50ms
-                        clearSpeakerTimerRef.current = window.setTimeout(() => setActiveSpeaker(null), 400);
-                    }
+        pc.onconnectionstatechange = () => {
+            if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                const el = remoteAudiosRef.current.get(peerId);
+                if (el) { try { el.srcObject = null; } catch { } remoteAudiosRef.current.delete(peerId); }
+            }
+        };
 
-                    const fmt = parsePcmMime(mimeType);
-                    let u8: Uint8Array | undefined;
+        pcsRef.current.set(peerId, pc);
+        return pc;
+    }, []);
 
-                    if (data instanceof Uint8Array) u8 = data;
-                    else if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
-                    else if (Array.isArray(data)) u8 = new Uint8Array(data as number[]);
-                    else if (typeof data === 'string') {
-                        // Fallback: legacy JSON base64
-                        const bin = atob(data);
-                        const tmp = new Uint8Array(bin.length);
-                        for (let i = 0; i < bin.length; i++) tmp[i] = bin.charCodeAt(i);
-                        u8 = tmp;
-                    }
+    // Offer to a peer
+    const makeOffer = useCallback(async (peerId: string) => {
+        if (!peerId) return; // guard against undefined/null ids
+        const pc = createPc(peerId);
+        await addLocalToPc(pc);
+        const offer = await pc.createOffer({ offerToReceiveAudio: true });
+        await pc.setLocalDescription(offer);
+        await hubRef.current?.invoke('SendOffer', peerId, offer.sdp ?? '', nameRef.current);
+    }, [addLocalToPc, createPc]);
 
-                    if (!u8 || u8.length === 0 || !fmt || fmt.bits !== 16) return;
+    // Answer to a peer
+    const makeAnswer = useCallback(async (peerId: string, sdp: string) => {
+        const pc = createPc(peerId);
+        await addLocalToPc(pc);
+        await pc.setRemoteDescription({ type: 'offer', sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await hubRef.current?.invoke('SendAnswer', peerId, answer.sdp ?? '');
+    }, [addLocalToPc, createPc]);
 
-                    const f32 = int16ToFloat32PCM(u8);
-                    enqueuePcm(f32, fmt);
-                } catch (err) {
-                    console.error('Failed to handle incoming audio', err);
-                }
-            });
-
-            connectionRef.current.onreconnecting(() => setStatus('connecting'));
-            connectionRef.current.onreconnected(() => {
-                setStatus('connected');
-                const ctx = audioCtxRef.current;
-                nextStartTimeRef.current = ctx ? ctx.currentTime : 0;
-            });
-            connectionRef.current.onclose(() => setStatus('idle'));
+    const applyAnswer = useCallback(async (peerId: string, sdp: string) => {
+        const pc = pcsRef.current.get(peerId);
+        if (!pc) return;
+        if (!pc.currentRemoteDescription) {
+            await pc.setRemoteDescription({ type: 'answer', sdp });
         }
+    }, []);
+
+    const applyIce = useCallback(async (peerId: string, candidateJson: string) => {
+        const pc = pcsRef.current.get(peerId);
+        if (!pc || !candidateJson) return;
+        try {
+            const init = JSON.parse(candidateJson) as RTCIceCandidateInit;
+            await pc.addIceCandidate(init);
+        } catch { /* ignore malformed/dupe */ }
+    }, []);
+
+    // SignalR (signaling) — start with retry to avoid StrictMode aborts
+    useEffect(() => {
+        if (hubRef.current) return;
+
+        hubRef.current = new signalR.HubConnectionBuilder()
+            .withUrl(HUB_URL, {
+                transport: signalR.HttpTransportType.WebSockets,
+                skipNegotiation: true,
+                withCredentials: true,
+            })
+            .withHubProtocol(new MessagePackHubProtocol())
+            .withAutomaticReconnect()
+            .build();
+
+        // Presence
+        hubRef.current.on('PeerJoined', (peerId: string, peerName: string) => {
+            peerNamesRef.current.set(peerId, peerName);
+            makeOffer(peerId).catch(() => { });
+        });
+        hubRef.current.on('PeerLeft', (peerId: string) => {
+            peerNamesRef.current.delete(peerId);
+            const pc = pcsRef.current.get(peerId);
+            if (pc) { try { pc.close(); } catch { } pcsRef.current.delete(peerId); }
+            const el = remoteAudiosRef.current.get(peerId);
+            if (el) { try { el.srcObject = null; } catch { } remoteAudiosRef.current.delete(peerId); }
+        });
+        hubRef.current.on('PeerRenamed', (peerId: string, newName: string) => {
+            peerNamesRef.current.set(peerId, newName);
+        });
+
+        // Signaling messages
+        hubRef.current.on('RtcOffer', async (fromId: string, fromName: string, sdp: string) => {
+            peerNamesRef.current.set(fromId, fromName);
+            await makeAnswer(fromId, sdp);
+        });
+        hubRef.current.on('RtcAnswer', async (fromId: string, sdp: string) => {
+            await applyAnswer(fromId, sdp);
+        });
+        hubRef.current.on('RtcIce', async (fromId: string, candidateJson: string) => {
+            await applyIce(fromId, candidateJson);
+        });
 
         let disposed = false;
+
+        const isBenignAbort = (err: any) => {
+            const msg = String(err?.message || '').toLowerCase();
+            return err?.name === 'AbortError'
+                || msg.includes('stopped during negotiation')
+                || msg.includes('before stop');
+        };
 
         const start = async (delayMs = 0) => {
             if (startingRef.current) return;
             startingRef.current = true;
             try {
-                if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
-                if (disposed || !connectionRef.current) return;
-                if (connectionRef.current.state === signalR.HubConnectionState.Disconnected) {
+                if (delayMs) await new Promise(r => setTimeout(r, delayMs));
+                if (disposed || !hubRef.current) return;
+
+                if (hubRef.current.state === signalR.HubConnectionState.Disconnected) {
                     setStatus('connecting');
-                    await connectionRef.current.start();
-                    if (!disposed) setStatus('connected');
-                } else if (connectionRef.current.state === signalR.HubConnectionState.Connected) {
+                    await hubRef.current.start();
+                    if (disposed) return;
+                    setStatus('connected');
+
+                    // Advertise our name and offer to existing peers
+                    await hubRef.current.invoke('SetName', nameRef.current);
+                    const peers = await hubRef.current.invoke<PeerInfo[]>('GetPeers');
+                    for (const p of peers ?? []) {
+                        const id = p?.ConnectionId;
+                        const nm = p?.Name ?? 'Guest';
+                        if (!id) continue;
+                        peerNamesRef.current.set(id, nm);
+                        await makeOffer(id);
+                    }
+                } else {
                     setStatus('connected');
                 }
-            } catch (err: any) {
-                const msg = String(err?.message || err);
-                if (msg.toLowerCase().includes('stopped during negotiation')) {
+            } catch (err) {
+                if (!disposed && isBenignAbort(err)) {
+                    // React StrictMode first-mount cleanup race — retry shortly
                     startingRef.current = false;
-                    if (!disposed) start(200);
+                    setTimeout(() => start(150), 150);
                     return;
                 }
-                console.error('SignalR connect failed', err);
+                console.error('SignalR signaling start failed', err);
                 if (!disposed) setStatus('idle');
             } finally {
                 startingRef.current = false;
             }
         };
 
-        setTimeout(() => start(), 0);
+        // Defer initial start a tick to dodge StrictMode immediate cleanup race
+        const t = setTimeout(() => start(), 0);
 
         return () => {
             disposed = true;
-            const c = connectionRef.current;
-            if (c && c.state !== signalR.HubConnectionState.Disconnected) {
-                c.stop().catch(() => { });
+            clearTimeout(t);
+            const hub = hubRef.current;
+            hubRef.current = null;
+            if (hub && hub.state !== signalR.HubConnectionState.Disconnected) {
+                hub.stop().catch(() => { });
             }
-            try { audioCtxRef.current?.close(); } catch { }
-            audioCtxRef.current = null;
-            nextStartTimeRef.current = 0;
-            scheduleChainRef.current = Promise.resolve();
-
-            if (clearSpeakerTimerRef.current) {
-                clearTimeout(clearSpeakerTimerRef.current);
-                clearSpeakerTimerRef.current = null;
+            // Close PCs
+            for (const [id, pc] of pcsRef.current) {
+                try { pc.close(); } catch { }
+                pcsRef.current.delete(id);
+            }
+            // Cleanup audio elements
+            for (const el of remoteAudiosRef.current.values()) {
+                try { el.srcObject = null; } catch { }
+            }
+            remoteAudiosRef.current.clear();
+            // Stop local media
+            if (localStreamRef.current) {
+                try { localStreamRef.current.getTracks().forEach(t => t.stop()); } catch { }
+                localStreamRef.current = null;
+                localTrackRef.current = null;
             }
         };
-    }, [enqueuePcm]);
+    }, [applyAnswer, applyIce, makeAnswer, makeOffer]);
 
+    // PTT: toggle local track enabled
     const startRecording = useCallback(async () => {
         if (status !== 'connected') return;
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-            const ctx = await ensureAudioContext();
-
-            const source = ctx.createMediaStreamSource(stream);
-            const bufferSize = 2048;
-            const channels = Math.min(source.channelCount || 1, 2);
-            const processor = ctx.createScriptProcessor(bufferSize, channels, 1);
-            source.connect(processor);
-            processor.connect(ctx.destination);
-
-            const fmt = { bits: 16, rate: ctx.sampleRate, channels: 1 as const };
-
-            processor.onaudioprocess = (e) => {
-                try {
-                    const inCh0 = e.inputBuffer.getChannelData(0);
-                    const len = inCh0.length;
-                    let mono: Float32Array;
-
-                    if (channels === 1) {
-                        mono = new Float32Array(len);
-                        mono.set(inCh0);
-                    } else {
-                        const inCh1 = e.inputBuffer.getChannelData(1);
-                        mono = new Float32Array(len);
-                        for (let i = 0; i < len; i++) mono[i] = (inCh0[i] + inCh1[i]) * 0.5;
-                    }
-
-                    const u8 = float32ToInt16PCM(mono);
-                    // Send Uint8Array directly (MessagePack binary)
-                    connectionRef.current?.invoke('SendVoiceNote', u8, buildPcmMime(fmt), nameRef.current)
-                        .catch((err) => console.error('Failed to send PCM chunk', err));
-                } catch (err) {
-                    console.error('PCM capture/send failed', err);
-                }
-            };
-
-            sendStreamRef.current = stream;
-            sendSourceRef.current = source;
-            sendProcessorRef.current = processor;
-
+            const track = await ensureLocalTrack();
+            track.enabled = true;
             setStatus('recording');
         } catch {
             alert('Microphone permission is required.');
         }
-    }, [status, ensureAudioContext]);
+    }, [ensureLocalTrack, status]);
 
     const stopRecording = useCallback(async () => {
-        const proc = sendProcessorRef.current;
-        const src = sendSourceRef.current;
-        const stream = sendStreamRef.current;
-
-        if (proc) { try { proc.disconnect(); } catch { } sendProcessorRef.current = null; }
-        if (src) { try { src.disconnect(); } catch { } sendSourceRef.current = null; }
-        if (stream) { try { stream.getTracks().forEach(t => t.stop()); } catch { } sendStreamRef.current = null; }
-
+        const track = localTrackRef.current;
+        if (track) track.enabled = false;
         setStatus('connected');
     }, []);
 
@@ -315,7 +292,7 @@ export default function VoiceChat() {
         if (status === 'recording') stopRecording();
     }, [status, stopRecording]);
 
-    // Allow holding ArrowDown key as PTT
+    // Keyboard PTT (ArrowDown)
     useEffect(() => {
         const isEditable = (el: Element | null) => {
             if (!el) return false;
@@ -326,27 +303,20 @@ export default function VoiceChat() {
 
         const onKeyDown = (e: KeyboardEvent) => {
             if (e.key !== 'ArrowDown') return;
-            if (isEditable(document.activeElement)) return; // don't steal while typing
-            if (e.repeat) { e.preventDefault(); return; } // ignore auto-repeat
+            if (isEditable(document.activeElement)) return;
+            if (e.repeat) { e.preventDefault(); return; }
             e.preventDefault();
-
             if (!pttKeyDownRef.current) {
                 pttKeyDownRef.current = true;
-                if (status === 'connected') {
-                    startRecording();
-                }
+                if (status === 'connected') startRecording();
             }
         };
-
         const onKeyUp = (e: KeyboardEvent) => {
             if (e.key !== 'ArrowDown') return;
             e.preventDefault();
             pttKeyDownRef.current = false;
-            if (status === 'recording') {
-                stopRecording();
-            }
+            if (status === 'recording') stopRecording();
         };
-
         const onBlurOrHide = () => {
             if (pttKeyDownRef.current) pttKeyDownRef.current = false;
             if (status === 'recording') stopRecording();
@@ -356,36 +326,23 @@ export default function VoiceChat() {
         window.addEventListener('keyup', onKeyUp, true);
         window.addEventListener('blur', onBlurOrHide);
         document.addEventListener('visibilitychange', onBlurOrHide);
-
         return () => {
             window.removeEventListener('keydown', onKeyDown, true);
             window.removeEventListener('keyup', onKeyUp, true);
             window.removeEventListener('blur', onBlurOrHide);
             document.removeEventListener('visibilitychange', onBlurOrHide);
         };
-    }, [status, startRecording, stopRecording]);
+    }, [startRecording, status, stopRecording]);
 
     return (
         <div style={{ display: 'grid', gap: 12, maxWidth: 420 }}>
-            <h2>Push-to-Talk (PoC)</h2>
+            <h2>Push-to-Talk (WebRTC)</h2>
 
-            {/* Speaking indicator */}
             {activeSpeaker && (
-                <div
-                    role="status"
-                    aria-live="polite"
-                    style={{
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        gap: 8,
-                        padding: '6px 10px',
-                        borderRadius: 999,
-                        background: '#eef6ff',
-                        color: '#0b5cab',
-                        width: 'fit-content'
-                    }}
-                    title="Someone is talking"
-                >
+                <div role="status" aria-live="polite" style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 8, padding: '6px 10px',
+                    borderRadius: 999, background: '#eef6ff', color: '#0b5cab', width: 'fit-content'
+                }}>
                     <span style={{
                         width: 8, height: 8, borderRadius: 999, background: '#2ecc71',
                         boxShadow: '0 0 0 3px rgba(46,204,113,0.25)'
@@ -396,7 +353,10 @@ export default function VoiceChat() {
 
             <label style={{ display: 'grid', gap: 6 }}>
                 <span>Your name</span>
-                <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Guest" />
+                <input value={name} onChange={(e) => {
+                    setName(e.target.value);
+                    hubRef.current?.invoke('SetName', e.target.value).catch(() => { });
+                }} placeholder="Guest" />
             </label>
 
             <button
@@ -423,10 +383,7 @@ export default function VoiceChat() {
             </button>
 
             <small style={{ color: '#666' }}>
-                Tip: Hold the ArrowDown key to talk, or hold the button with the mouse/touch.
-            </small>
-            <small style={{ color: '#666' }}>
-                Streaming live while held. Sends PCM16 frames and schedules them for gapless playback.
+                Tip: Hold ArrowDown or the button to talk. WebRTC carries audio; SignalR only signals.
             </small>
         </div>
     );
