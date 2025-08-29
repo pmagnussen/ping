@@ -1,0 +1,10 @@
+{
+"SpaProxyServer": {
+"ServerUrl": "https://localhost:51520",
+"RedirectUrl": "",
+"LaunchCommand": "npm run dev",
+"WorkingDirectory": "C:\\Users\\PaeturMagnussen\\source\\repos\\Ping\\Ping.Server\\..\\ping.client",
+"MaxTimeoutInSeconds": "120",
+"KeepRunning": "false"
+}
+}
