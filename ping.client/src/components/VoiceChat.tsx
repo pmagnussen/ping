@@ -86,6 +86,9 @@ export default function VoiceChat() {
     const [activeSpeaker, setActiveSpeaker] = useState<string | null>(null);
     const clearSpeakerTimerRef = useRef<number | null>(null);
 
+    // PTT keyboard state
+    const pttKeyDownRef = useRef(false);
+
     useEffect(() => { nameRef.current = name; }, [name]);
 
     useEffect(() => {
@@ -312,6 +315,56 @@ export default function VoiceChat() {
         if (status === 'recording') stopRecording();
     }, [status, stopRecording]);
 
+    // Allow holding ArrowDown key as PTT
+    useEffect(() => {
+        const isEditable = (el: Element | null) => {
+            if (!el) return false;
+            const tag = el.tagName;
+            const editable = (el as HTMLElement).isContentEditable;
+            return editable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+        };
+
+        const onKeyDown = (e: KeyboardEvent) => {
+            if (e.key !== 'ArrowDown') return;
+            if (isEditable(document.activeElement)) return; // don't steal while typing
+            if (e.repeat) { e.preventDefault(); return; } // ignore auto-repeat
+            e.preventDefault();
+
+            if (!pttKeyDownRef.current) {
+                pttKeyDownRef.current = true;
+                if (status === 'connected') {
+                    startRecording();
+                }
+            }
+        };
+
+        const onKeyUp = (e: KeyboardEvent) => {
+            if (e.key !== 'ArrowDown') return;
+            e.preventDefault();
+            pttKeyDownRef.current = false;
+            if (status === 'recording') {
+                stopRecording();
+            }
+        };
+
+        const onBlurOrHide = () => {
+            if (pttKeyDownRef.current) pttKeyDownRef.current = false;
+            if (status === 'recording') stopRecording();
+        };
+
+        window.addEventListener('keydown', onKeyDown, true);
+        window.addEventListener('keyup', onKeyUp, true);
+        window.addEventListener('blur', onBlurOrHide);
+        document.addEventListener('visibilitychange', onBlurOrHide);
+
+        return () => {
+            window.removeEventListener('keydown', onKeyDown, true);
+            window.removeEventListener('keyup', onKeyUp, true);
+            window.removeEventListener('blur', onBlurOrHide);
+            document.removeEventListener('visibilitychange', onBlurOrHide);
+        };
+    }, [status, startRecording, stopRecording]);
+
     return (
         <div style={{ display: 'grid', gap: 12, maxWidth: 420 }}>
             <h2>Push-to-Talk (PoC)</h2>
@@ -369,6 +422,9 @@ export default function VoiceChat() {
                             : 'Hold to Talk'}
             </button>
 
+            <small style={{ color: '#666' }}>
+                Tip: Hold the ArrowDown key to talk, or hold the button with the mouse/touch.
+            </small>
             <small style={{ color: '#666' }}>
                 Streaming live while held. Sends PCM16 frames and schedules them for gapless playback.
             </small>
