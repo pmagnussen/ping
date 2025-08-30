@@ -3,9 +3,9 @@ import * as signalR from '@microsoft/signalr';
 import { MessagePackHubProtocol } from '@microsoft/signalr-protocol-msgpack';
 
 type Status = 'idle' | 'connecting' | 'connected' | 'recording';
-// Use production API in prod, local in dev
-const HUB_URL = import.meta.env.PROD ? 'https://api.ping.vera.fo/voice' : 'https://localhost:7160/voice';
-
+const HUB_URL =
+    (import.meta as any).env?.VITE_SIGNALR_HUB
+    || (import.meta.env.PROD ? 'https://ping.vera.fo/api/voice' : 'https://localhost:7160/voice');
 // Note: PascalCase to match MessagePack payload from .NET (PeerInfo.ConnectionId/Name)
 type PeerInfo = { ConnectionId: string; Name: string };
 
@@ -29,6 +29,7 @@ export default function VoiceChat() {
     // UI: who is currently talking (basic indicator)
     const [activeSpeaker, setActiveSpeaker] = useState<string | null>(null);
     const activeSpeakerTimerRef = useRef<number | null>(null);
+    const activeSpeakerPeerRef = useRef<string | null>(null);
 
     // For Safari/iOS autoplay policies — keep audio elements in DOM
     const audioContainerRef = useRef<HTMLDivElement | null>(null);
@@ -77,9 +78,7 @@ export default function VoiceChat() {
         pc = new RTCPeerConnection({
             iceServers: [
                 { urls: ['stun:stun.l.google.com:19302'] }
-                // When ready, add your TURN server and set iceTransportPolicy: 'relay'
-                // Example:
-                // { urls: 'turns:turn.vera.fo:5349?transport=tcp', username: 'user', credential: 'pass' }
+                // To avoid direct P2P, configure TURN and set iceTransportPolicy: 'relay'
             ]
         });
 
@@ -96,7 +95,8 @@ export default function VoiceChat() {
             if (!el) {
                 el = new Audio();
                 el.autoplay = true;
-                el.playsInline = true;
+                // playsInline is not on HTMLAudioElement; add attribute for iOS policies
+                el.setAttribute('playsinline', '');
                 el.muted = false; // ensure not muted
                 // Keep element in DOM for Safari/iOS
                 if (audioContainerRef.current && !el.parentNode) {
@@ -196,7 +196,6 @@ export default function VoiceChat() {
 
         // Presence
         hubRef.current.on('PeerJoined', (peerId: string, peerName: string) => {
-            // Important: do NOT offer here; the joining peer will offer to us to avoid glare.
             peerNamesRef.current.set(peerId, peerName);
         });
         hubRef.current.on('PeerLeft', (peerId: string) => {
@@ -210,9 +209,25 @@ export default function VoiceChat() {
                 remoteAudiosRef.current.delete(peerId);
             }
             pendingIceRef.current.delete(peerId);
+            if (activeSpeakerPeerRef.current === peerId) {
+                activeSpeakerPeerRef.current = null;
+                setActiveSpeaker(null);
+            }
         });
         hubRef.current.on('PeerRenamed', (peerId: string, newName: string) => {
             peerNamesRef.current.set(peerId, newName);
+        });
+
+        // NEW: talking indicator broadcast
+        hubRef.current.on('PeerTalking', (peerId: string, peerName: string, talking: boolean) => {
+            peerNamesRef.current.set(peerId, peerName || 'Guest');
+            if (talking) {
+                activeSpeakerPeerRef.current = peerId;
+                setActiveSpeaker(peerName || 'Guest');
+            } else if (activeSpeakerPeerRef.current === peerId) {
+                activeSpeakerPeerRef.current = null;
+                setActiveSpeaker(null);
+            }
         });
 
         // Signaling messages
@@ -249,7 +264,6 @@ export default function VoiceChat() {
                     if (disposed) return;
                     setStatus('connected');
 
-                    // Advertise our name and offer to existing peers (only the joiner offers)
                     await hubRef.current.invoke('SetName', nameRef.current);
                     const peers = await hubRef.current.invoke<PeerInfo[]>('GetPeers');
                     for (const p of peers ?? []) {
@@ -285,19 +299,16 @@ export default function VoiceChat() {
             if (hub && hub.state !== signalR.HubConnectionState.Disconnected) {
                 hub.stop().catch(() => { });
             }
-            // Close PCs
             for (const [id, pc] of pcsRef.current) {
                 try { pc.close(); } catch { }
                 pcsRef.current.delete(id);
             }
-            // Cleanup audio elements
             for (const el of remoteAudiosRef.current.values()) {
                 try { el.srcObject = null; } catch { }
                 try { el.remove?.(); } catch { }
             }
             remoteAudiosRef.current.clear();
             pendingIceRef.current.clear();
-            // Stop local media
             if (localStreamRef.current) {
                 try { localStreamRef.current.getTracks().forEach(t => t.stop()); } catch { }
                 localStreamRef.current = null;
@@ -306,17 +317,18 @@ export default function VoiceChat() {
         };
     }, [applyAnswer, applyIce, makeAnswer, makeOffer]);
 
-    // PTT: toggle local track enabled
+    // PTT: toggle local track enabled + broadcast talking state
     const startRecording = useCallback(async () => {
         if (status !== 'connected') return;
         try {
-            // Attempt to unlock autoplay on user gesture
             for (const el of remoteAudiosRef.current.values()) {
                 try { await el.play(); } catch { /* ignore */ }
             }
             const track = await ensureLocalTrack();
             track.enabled = true;
             setStatus('recording');
+            // announce start talking
+            hubRef.current?.invoke('SetTalking', true).catch(() => { });
         } catch {
             alert('Microphone permission is required.');
         }
@@ -326,6 +338,8 @@ export default function VoiceChat() {
         const track = localTrackRef.current;
         if (track) track.enabled = false;
         setStatus('connected');
+        // announce stop talking
+        hubRef.current?.invoke('SetTalking', false).catch(() => { });
     }, []);
 
     const handlePointerDown = useCallback((e: React.PointerEvent<HTMLButtonElement>) => {
@@ -410,6 +424,9 @@ export default function VoiceChat() {
                 onPointerUp={handlePointerUpOrCancel}
                 onPointerCancel={handlePointerUpOrCancel}
                 onPointerLeave={(e) => { if (status === 'recording') handlePointerUpOrCancel(e); }}
+                onSelect={(e) => e.preventDefault()}
+                onMouseDown={(e) => e.preventDefault()}
+                onDragStart={(e) => e.preventDefault()}
                 disabled={status === 'connecting' || status === 'idle'}
                 style={{
                     padding: '14px 18px',
@@ -419,6 +436,13 @@ export default function VoiceChat() {
                     background: status === 'recording' ? 'black' : 'black',
                     color: 'white',
                     border: '1px solid',
+                    // prevent text selection / touch callouts
+                    userSelect: 'none',
+                    WebkitUserSelect: 'none',
+                    msUserSelect: 'none',
+                    MozUserSelect: 'none',
+                    WebkitTouchCallout: 'none',
+                    WebkitTapHighlightColor: 'transparent',
                 }}
                 aria-pressed={status === 'recording'}
             >

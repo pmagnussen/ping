@@ -51,19 +51,19 @@ namespace Ping.Server.Hubs
 
         // WebRTC signaling
         public Task SendOffer(string targetConnectionId, string sdp, string fromName)
-        {
-            return Clients.Client(targetConnectionId).SendAsync("RtcOffer", Context.ConnectionId, fromName, sdp);
-        }
-
+            => Clients.Client(targetConnectionId).SendAsync("RtcOffer", Context.ConnectionId, fromName, sdp);
 
         public Task SendAnswer(string targetConnectionId, string sdp)
-        {
-            return Clients.Client(targetConnectionId).SendAsync("RtcAnswer", Context.ConnectionId, sdp);
-        }
+            => Clients.Client(targetConnectionId).SendAsync("RtcAnswer", Context.ConnectionId, sdp);
 
         public Task SendIce(string targetConnectionId, string candidate)
+            => Clients.Client(targetConnectionId).SendAsync("RtcIce", Context.ConnectionId, candidate);
+
+        // NEW: simple talking indicator broadcast
+        public Task SetTalking(bool talking)
         {
-            return Clients.Client(targetConnectionId).SendAsync("RtcIce", Context.ConnectionId, candidate);
+            var name = Peers.TryGetValue(Context.ConnectionId, out var n) ? n : "Guest";
+            return Clients.Others.SendAsync("PeerTalking", Context.ConnectionId, name, talking);
         }
     }
 }
