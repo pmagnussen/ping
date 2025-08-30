@@ -3,7 +3,8 @@ import * as signalR from '@microsoft/signalr';
 import { MessagePackHubProtocol } from '@microsoft/signalr-protocol-msgpack';
 
 type Status = 'idle' | 'connecting' | 'connected' | 'recording';
-const HUB_URL = 'https://localhost:7160/voice';
+// Use production API in prod, local in dev
+const HUB_URL = import.meta.env.PROD ? 'https://api.ping.vera.fo/voice' : 'https://localhost:7160/voice';
 
 // Note: PascalCase to match MessagePack payload from .NET (PeerInfo.ConnectionId/Name)
 type PeerInfo = { ConnectionId: string; Name: string };
@@ -23,10 +24,14 @@ export default function VoiceChat() {
     const remoteAudiosRef = useRef<Map<string, HTMLAudioElement>>(new Map());
     const localStreamRef = useRef<MediaStream | null>(null);
     const localTrackRef = useRef<MediaStreamTrack | null>(null);
+    const pendingIceRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
 
     // UI: who is currently talking (basic indicator)
     const [activeSpeaker, setActiveSpeaker] = useState<string | null>(null);
     const activeSpeakerTimerRef = useRef<number | null>(null);
+
+    // For Safari/iOS autoplay policies — keep audio elements in DOM
+    const audioContainerRef = useRef<HTMLDivElement | null>(null);
 
     // PTT keyboard state
     const pttKeyDownRef = useRef(false);
@@ -55,6 +60,15 @@ export default function VoiceChat() {
         }
     }, [ensureLocalTrack]);
 
+    const flushPendingIce = useCallback(async (peerId: string, pc: RTCPeerConnection) => {
+        const queued = pendingIceRef.current.get(peerId);
+        if (!queued || queued.length === 0) return;
+        for (const c of queued) {
+            try { await pc.addIceCandidate(c); } catch { /* ignore */ }
+        }
+        pendingIceRef.current.delete(peerId);
+    }, []);
+
     // Create a new RTCPeerConnection to a peer
     const createPc = useCallback((peerId: string) => {
         let pc = pcsRef.current.get(peerId);
@@ -63,7 +77,9 @@ export default function VoiceChat() {
         pc = new RTCPeerConnection({
             iceServers: [
                 { urls: ['stun:stun.l.google.com:19302'] }
-                // To avoid direct P2P, configure TURN and set iceTransportPolicy: 'relay'
+                // When ready, add your TURN server and set iceTransportPolicy: 'relay'
+                // Example:
+                // { urls: 'turns:turn.vera.fo:5349?transport=tcp', username: 'user', credential: 'pass' }
             ]
         });
 
@@ -81,7 +97,14 @@ export default function VoiceChat() {
                 el = new Audio();
                 el.autoplay = true;
                 el.playsInline = true;
+                el.muted = false; // ensure not muted
+                // Keep element in DOM for Safari/iOS
+                if (audioContainerRef.current && !el.parentNode) {
+                    audioContainerRef.current.appendChild(el);
+                }
                 remoteAudiosRef.current.set(peerId, el);
+            } else {
+                el.muted = false;
             }
             el.srcObject = ms;
             el.play().catch(() => { /* will play after first user gesture */ });
@@ -98,7 +121,11 @@ export default function VoiceChat() {
         pc.onconnectionstatechange = () => {
             if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
                 const el = remoteAudiosRef.current.get(peerId);
-                if (el) { try { el.srcObject = null; } catch { } remoteAudiosRef.current.delete(peerId); }
+                if (el) {
+                    try { el.srcObject = null; } catch { }
+                    try { el.remove?.(); } catch { }
+                    remoteAudiosRef.current.delete(peerId);
+                }
             }
         };
 
@@ -108,7 +135,7 @@ export default function VoiceChat() {
 
     // Offer to a peer
     const makeOffer = useCallback(async (peerId: string) => {
-        if (!peerId) return; // guard against undefined/null ids
+        if (!peerId) return;
         const pc = createPc(peerId);
         await addLocalToPc(pc);
         const offer = await pc.createOffer({ offerToReceiveAudio: true });
@@ -121,29 +148,39 @@ export default function VoiceChat() {
         const pc = createPc(peerId);
         await addLocalToPc(pc);
         await pc.setRemoteDescription({ type: 'offer', sdp });
+        await flushPendingIce(peerId, pc);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         await hubRef.current?.invoke('SendAnswer', peerId, answer.sdp ?? '');
-    }, [addLocalToPc, createPc]);
+    }, [addLocalToPc, createPc, flushPendingIce]);
 
     const applyAnswer = useCallback(async (peerId: string, sdp: string) => {
         const pc = pcsRef.current.get(peerId);
         if (!pc) return;
-        if (!pc.currentRemoteDescription) {
+        if (!pc.currentRemoteDescription && !pc.remoteDescription) {
             await pc.setRemoteDescription({ type: 'answer', sdp });
         }
-    }, []);
+        await flushPendingIce(peerId, pc);
+    }, [flushPendingIce]);
 
     const applyIce = useCallback(async (peerId: string, candidateJson: string) => {
         const pc = pcsRef.current.get(peerId);
         if (!pc || !candidateJson) return;
         try {
             const init = JSON.parse(candidateJson) as RTCIceCandidateInit;
+            if (!pc.currentRemoteDescription && !pc.remoteDescription) {
+                const q = pendingIceRef.current.get(peerId) ?? [];
+                q.push(init);
+                pendingIceRef.current.set(peerId, q);
+                return;
+            }
             await pc.addIceCandidate(init);
-        } catch { /* ignore malformed/dupe */ }
+        } catch {
+            // ignore malformed/dupe
+        }
     }, []);
 
-    // SignalR (signaling) — start with retry to avoid StrictMode aborts
+    // SignalR (signaling)
     useEffect(() => {
         if (hubRef.current) return;
 
@@ -159,15 +196,20 @@ export default function VoiceChat() {
 
         // Presence
         hubRef.current.on('PeerJoined', (peerId: string, peerName: string) => {
+            // Important: do NOT offer here; the joining peer will offer to us to avoid glare.
             peerNamesRef.current.set(peerId, peerName);
-            makeOffer(peerId).catch(() => { });
         });
         hubRef.current.on('PeerLeft', (peerId: string) => {
             peerNamesRef.current.delete(peerId);
             const pc = pcsRef.current.get(peerId);
             if (pc) { try { pc.close(); } catch { } pcsRef.current.delete(peerId); }
             const el = remoteAudiosRef.current.get(peerId);
-            if (el) { try { el.srcObject = null; } catch { } remoteAudiosRef.current.delete(peerId); }
+            if (el) {
+                try { el.srcObject = null; } catch { }
+                try { el.remove?.(); } catch { }
+                remoteAudiosRef.current.delete(peerId);
+            }
+            pendingIceRef.current.delete(peerId);
         });
         hubRef.current.on('PeerRenamed', (peerId: string, newName: string) => {
             peerNamesRef.current.set(peerId, newName);
@@ -207,7 +249,7 @@ export default function VoiceChat() {
                     if (disposed) return;
                     setStatus('connected');
 
-                    // Advertise our name and offer to existing peers
+                    // Advertise our name and offer to existing peers (only the joiner offers)
                     await hubRef.current.invoke('SetName', nameRef.current);
                     const peers = await hubRef.current.invoke<PeerInfo[]>('GetPeers');
                     for (const p of peers ?? []) {
@@ -222,7 +264,6 @@ export default function VoiceChat() {
                 }
             } catch (err) {
                 if (!disposed && isBenignAbort(err)) {
-                    // React StrictMode first-mount cleanup race — retry shortly
                     startingRef.current = false;
                     setTimeout(() => start(150), 150);
                     return;
@@ -234,7 +275,6 @@ export default function VoiceChat() {
             }
         };
 
-        // Defer initial start a tick to dodge StrictMode immediate cleanup race
         const t = setTimeout(() => start(), 0);
 
         return () => {
@@ -253,8 +293,10 @@ export default function VoiceChat() {
             // Cleanup audio elements
             for (const el of remoteAudiosRef.current.values()) {
                 try { el.srcObject = null; } catch { }
+                try { el.remove?.(); } catch { }
             }
             remoteAudiosRef.current.clear();
+            pendingIceRef.current.clear();
             // Stop local media
             if (localStreamRef.current) {
                 try { localStreamRef.current.getTracks().forEach(t => t.stop()); } catch { }
@@ -268,6 +310,10 @@ export default function VoiceChat() {
     const startRecording = useCallback(async () => {
         if (status !== 'connected') return;
         try {
+            // Attempt to unlock autoplay on user gesture
+            for (const el of remoteAudiosRef.current.values()) {
+                try { await el.play(); } catch { /* ignore */ }
+            }
             const track = await ensureLocalTrack();
             track.enabled = true;
             setStatus('recording');
@@ -335,7 +381,7 @@ export default function VoiceChat() {
     }, [startRecording, status, stopRecording]);
 
     return (
-        <div style={{ display: 'grid', gap: 12, maxWidth: 420 }}>
+        <div style={{ display: 'grid', gap: 12, maxWidth: 420, position: 'relative' }}>
             <h2>Push-to-Talk (WebRTC)</h2>
 
             {activeSpeaker && (
@@ -385,6 +431,9 @@ export default function VoiceChat() {
             <small style={{ color: '#666' }}>
                 Tip: Hold ArrowDown or the button to talk. WebRTC carries audio; SignalR only signals.
             </small>
+
+            {/* Hidden container to attach remote <audio> elements for iOS/Safari */}
+            <div ref={audioContainerRef} aria-hidden="true" style={{ position: 'absolute', left: -99999, width: 1, height: 1, overflow: 'hidden' }} />
         </div>
     );
 }
