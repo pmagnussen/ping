@@ -1,4 +1,5 @@
-﻿import React, { useCallback, useEffect, useRef, useState } from 'react';
+﻿import { useCallback, useEffect, useRef, useState } from 'react';
+import type React from 'react';
 import * as signalR from '@microsoft/signalr';
 import { MessagePackHubProtocol } from '@microsoft/signalr-protocol-msgpack';
 
@@ -6,8 +7,53 @@ type Status = 'idle' | 'connecting' | 'connected' | 'recording';
 const HUB_URL =
     (import.meta as any).env?.VITE_SIGNALR_HUB
     || (import.meta.env.PROD ? 'https://ping.vera.fo/api/voice' : 'https://localhost:7160/voice');
+
+// Public STUN fallback (used only if you don't provide your own)
+const DEFAULT_PUBLIC_STUNS: RTCIceServer[] = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+];
+
+// Custom STUN from env (comma-separated). If provided, they replace the defaults.
+const STUN_URLS = (import.meta as any).env?.VITE_STUN_URLS as string | undefined;
+const STUN_SERVERS: RTCIceServer[] =
+    STUN_URLS
+        ? STUN_URLS.split(',').map(u => u.trim()).filter(Boolean).map(u => ({ urls: u }))
+        : DEFAULT_PUBLIC_STUNS;
+
+// TURN from env (unchanged)
+const TURN_URLS = (import.meta as any).env?.VITE_TURN_URLS as string | undefined; // comma-separated
+const TURN_USERNAME = (import.meta as any).env?.VITE_TURN_USERNAME as string | undefined;
+const TURN_CREDENTIAL = (import.meta as any).env?.VITE_TURN_CREDENTIAL as string | undefined;
+const ICE_POLICY = ((import.meta as any).env?.VITE_ICE_TRANSPORT_POLICY as RTCIceTransportPolicy) || 'all';
+
+const TURN_SERVERS: RTCIceServer[] =
+    TURN_URLS && TURN_USERNAME && TURN_CREDENTIAL
+        ? TURN_URLS.split(',').map(u => u.trim()).filter(Boolean).map(u => ({
+            urls: u, username: TURN_USERNAME!, credential: TURN_CREDENTIAL!
+        }))
+        : [];
+
+const RTC_CONFIG: RTCConfiguration = {
+    iceServers: [...STUN_SERVERS, ...TURN_SERVERS],
+    iceTransportPolicy: ICE_POLICY, // 'all' | 'relay'
+};
+
 // Note: PascalCase to match MessagePack payload from .NET (PeerInfo.ConnectionId/Name)
 type PeerInfo = { ConnectionId: string; Name: string };
+
+// Chat
+type ChatItem = {
+    id: string;
+    fromId: string;
+    fromName: string;
+    text: string;
+    atIso: string;
+};
+
+const newId = () => {
+    try { return crypto.randomUUID(); } catch { /* eslint-disable-next-line */ return Math.random().toString(36).slice(2); }
+};
 
 export default function VoiceChat() {
     const [status, setStatus] = useState<Status>('idle');
@@ -36,6 +82,17 @@ export default function VoiceChat() {
 
     // PTT keyboard state
     const pttKeyDownRef = useRef(false);
+
+    // Chat state
+    const [chat, setChat] = useState<ChatItem[]>([]);
+    const [chatInput, setChatInput] = useState('');
+    const chatScrollRef = useRef<HTMLDivElement | null>(null);
+    const chatListRef = useRef<HTMLDivElement | null>(null);
+
+    // Typing indicator state
+    const [typingNames, setTypingNames] = useState<string[]>([]);
+    const typingMapRef = useRef<Map<string, { name: string; timer: number | null }>>(new Map());
+    const typingSelfRef = useRef<{ active: boolean; timeoutId: number | null }>({ active: false, timeoutId: null });
 
     useEffect(() => { nameRef.current = name; }, [name]);
 
@@ -75,12 +132,7 @@ export default function VoiceChat() {
         let pc = pcsRef.current.get(peerId);
         if (pc) return pc;
 
-        pc = new RTCPeerConnection({
-            iceServers: [
-                { urls: ['stun:stun.l.google.com:19302'] }
-                // To avoid direct P2P, configure TURN and set iceTransportPolicy: 'relay'
-            ]
-        });
+        pc = new RTCPeerConnection(RTC_CONFIG);
 
         pc.onicecandidate = (e) => {
             if (e.candidate) {
@@ -180,7 +232,103 @@ export default function VoiceChat() {
         }
     }, []);
 
-    // SignalR (signaling)
+    // Chat helpers
+    const addChatItem = useCallback((item: ChatItem) => {
+        setChat(prev => {
+            const next = [...prev, item];
+            // prevent unbounded growth
+            if (next.length > 500) next.splice(0, next.length - 500);
+            return next;
+        });
+    }, []);
+
+    const scrollChatToBottom = useCallback((smooth = true) => {
+        const el = chatScrollRef.current;
+        if (!el) return;
+        try {
+            el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+        } catch {
+            el.scrollTop = el.scrollHeight;
+        }
+    }, []);
+
+    useEffect(() => {
+        scrollChatToBottom(true);
+    }, [chat.length, scrollChatToBottom]);
+
+    const notifyTypingSelf = useCallback((active: boolean) => {
+        if (!hubRef.current) return;
+        hubRef.current.invoke('SetTyping', active).catch(() => { /* ignore */ });
+    }, []);
+
+    const onChatInputChanged = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+        const v = e.target.value;
+        setChatInput(v);
+        // typing debounce: send true immediately once, then false 2s after last keypress
+        if (!typingSelfRef.current.active) {
+            notifyTypingSelf(true);
+            typingSelfRef.current.active = true;
+        }
+        if (typingSelfRef.current.timeoutId) {
+            clearTimeout(typingSelfRef.current.timeoutId);
+            typingSelfRef.current.timeoutId = null;
+        }
+        typingSelfRef.current.timeoutId = window.setTimeout(() => {
+            notifyTypingSelf(false);
+            typingSelfRef.current.active = false;
+            typingSelfRef.current.timeoutId = null;
+        }, 2000);
+    }, [notifyTypingSelf]);
+
+    const sendChat = useCallback(async () => {
+        const text = chatInput.trim();
+        if (!text) return;
+        if (text.length > 4000) { alert('Message too long'); return; }
+
+        const fromId = hubRef.current?.connectionId ?? 'local';
+        const fromName = nameRef.current || 'Guest';
+        const atIso = new Date().toISOString();
+
+        // Local echo; server should broadcast to others (Clients.Others)
+        addChatItem({ id: newId(), fromId, fromName, text, atIso });
+        setChatInput('');
+        try {
+            await hubRef.current?.invoke('SendChat', text);
+        } catch {
+            // optionally show a toast/error
+        }
+    }, [addChatItem, chatInput]);
+
+    const onChatKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            if (status === 'connected' || status === 'recording') {
+                sendChat();
+            }
+        }
+    }, [sendChat, status]);
+
+    const clearTypingForPeer = useCallback((peerId: string) => {
+        const entry = typingMapRef.current.get(peerId);
+        if (entry?.timer) window.clearTimeout(entry.timer);
+        typingMapRef.current.delete(peerId);
+        setTypingNames(Array.from(typingMapRef.current.values()).map(v => v.name));
+    }, []);
+
+    const setTypingForPeer = useCallback((peerId: string, peerName: string, typing: boolean) => {
+        const current = typingMapRef.current.get(peerId);
+        if (typing) {
+            if (current?.timer) window.clearTimeout(current.timer);
+            const timer = window.setTimeout(() => clearTypingForPeer(peerId), 2500);
+            typingMapRef.current.set(peerId, { name: peerName || 'Guest', timer });
+        } else {
+            if (current?.timer) window.clearTimeout(current.timer);
+            typingMapRef.current.delete(peerId);
+        }
+        setTypingNames(Array.from(typingMapRef.current.values()).map(v => v.name));
+    }, [clearTypingForPeer]);
+
+    // SignalR (signaling + chat)
     useEffect(() => {
         if (hubRef.current) return;
 
@@ -213,12 +361,17 @@ export default function VoiceChat() {
                 activeSpeakerPeerRef.current = null;
                 setActiveSpeaker(null);
             }
+            clearTypingForPeer(peerId);
         });
         hubRef.current.on('PeerRenamed', (peerId: string, newName: string) => {
             peerNamesRef.current.set(peerId, newName);
+            // Update typing display if needed
+            if (typingMapRef.current.has(peerId)) {
+                setTypingForPeer(peerId, newName, true);
+            }
         });
 
-        // NEW: talking indicator broadcast
+        // Talking indicator broadcast
         hubRef.current.on('PeerTalking', (peerId: string, peerName: string, talking: boolean) => {
             peerNamesRef.current.set(peerId, peerName || 'Guest');
             if (talking) {
@@ -240,6 +393,14 @@ export default function VoiceChat() {
         });
         hubRef.current.on('RtcIce', async (fromId: string, candidateJson: string) => {
             await applyIce(fromId, candidateJson);
+        });
+
+        // Chat events
+        hubRef.current.on('ChatMessage', (fromId: string, fromName: string, text: string, atIso: string) => {
+            addChatItem({ id: newId(), fromId, fromName: fromName || 'Guest', text: String(text ?? ''), atIso: atIso || new Date().toISOString() });
+        });
+        hubRef.current.on('Typing', (fromId: string, fromName: string, typing: boolean) => {
+            setTypingForPeer(fromId, fromName || 'Guest', !!typing);
         });
 
         let disposed = false;
@@ -297,6 +458,8 @@ export default function VoiceChat() {
             const hub = hubRef.current;
             hubRef.current = null;
             if (hub && hub.state !== signalR.HubConnectionState.Disconnected) {
+                // Ensure we stop typing broadcast on disconnect
+                try { hub.invoke('SetTyping', false).catch(() => { }); } catch { }
                 hub.stop().catch(() => { });
             }
             for (const [id, pc] of pcsRef.current) {
@@ -314,8 +477,14 @@ export default function VoiceChat() {
                 localStreamRef.current = null;
                 localTrackRef.current = null;
             }
+            // Clear typing timers
+            for (const [, v] of typingMapRef.current) {
+                if (v.timer) clearTimeout(v.timer);
+            }
+            typingMapRef.current.clear();
+            setTypingNames([]);
         };
-    }, [applyAnswer, applyIce, makeAnswer, makeOffer]);
+    }, [applyAnswer, applyIce, makeAnswer, makeOffer, addChatItem, setTypingForPeer, clearTypingForPeer]);
 
     // PTT: toggle local track enabled + broadcast talking state
     const startRecording = useCallback(async () => {
@@ -395,8 +564,8 @@ export default function VoiceChat() {
     }, [startRecording, status, stopRecording]);
 
     return (
-        <div style={{ display: 'grid', gap: 12, maxWidth: 420, position: 'relative' }}>
-            <h2>Push-to-Talk (WebRTC)</h2>
+        <div style={{ display: 'grid', gap: 12, maxWidth: 640, position: 'relative' }}>
+            <h2>Push-to-Talk (WebRTC) + Chat (SignalR)</h2>
 
             {activeSpeaker && (
                 <div role="status" aria-live="polite" style={{
@@ -443,6 +612,7 @@ export default function VoiceChat() {
                     MozUserSelect: 'none',
                     WebkitTouchCallout: 'none',
                     WebkitTapHighlightColor: 'transparent',
+                    touchAction: 'manipulation',
                 }}
                 aria-pressed={status === 'recording'}
             >
@@ -453,8 +623,108 @@ export default function VoiceChat() {
             </button>
 
             <small style={{ color: '#666' }}>
-                Tip: Hold ArrowDown or the button to talk. WebRTC carries audio; SignalR only signals.
+                Tip: Hold ArrowDown or the button to talk. WebRTC carries audio; SignalR handles chat and signaling.
             </small>
+
+            {/* Chat UI */}
+            <div style={{
+                display: 'grid',
+                gridTemplateRows: 'minmax(240px, 1fr) auto auto',
+                gap: 8,
+                border: '1px solid #e5e7eb',
+                borderRadius: 12,
+                padding: 12,
+                background: '#fafafa'
+            }}>
+                <div
+                    ref={chatScrollRef}
+                    role="log"
+                    aria-live="polite"
+                    style={{ overflowY: 'auto', maxHeight: 320, paddingRight: 4 }}
+                >
+                    <div ref={chatListRef}>
+                        {chat.map(m => {
+                            const mine = m.fromId && hubRef.current?.connectionId && m.fromId === hubRef.current.connectionId;
+                            return (
+                                <div key={m.id} style={{
+                                    display: 'grid',
+                                    justifyItems: mine ? 'end' : 'start',
+                                    marginBottom: 8
+                                }}>
+                                    <div style={{
+                                        maxWidth: 520,
+                                        whiteSpace: 'pre-wrap',
+                                        wordBreak: 'break-word',
+                                        background: mine ? '#111827' : '#ffffff',
+                                        color: mine ? 'white' : 'black',
+                                        border: '1px solid #e5e7eb',
+                                        borderRadius: 10,
+                                        padding: '8px 10px',
+                                    }}>
+                                        <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 4 }}>
+                                            {m.fromName} · {new Date(m.atIso).toLocaleTimeString()}
+                                        </div>
+                                        <div>{m.text}</div>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+
+                {typingNames.length > 0 && (
+                    <div style={{ fontSize: 12, color: '#6b7280' }}>
+                        {typingNames.length === 1
+                            ? `${typingNames[0]} is typing…`
+                            : `${typingNames.slice(0, 2).join(', ')}${typingNames.length > 2 ? ` and ${typingNames.length - 2} others` : ''} are typing…`}
+                    </div>
+                )}
+
+                <div style={{ display: 'grid', gap: 8 }}>
+                    <textarea
+                        value={chatInput}
+                        onChange={onChatInputChanged}
+                        onKeyDown={onChatKeyDown}
+                        placeholder={status === 'connected' || status === 'recording' ? 'Type a message…' : 'Connect to chat'}
+                        disabled={status === 'idle' || status === 'connecting'}
+                        rows={2}
+                        style={{
+                            resize: 'none',
+                            padding: 10,
+                            borderRadius: 8,
+                            border: '1px solid #e5e7eb',
+                            fontFamily: 'inherit',
+                            outline: 'none'
+                        }}
+                        onBlur={() => {
+                            if (typingSelfRef.current.active) {
+                                notifyTypingSelf(false);
+                                typingSelfRef.current.active = false;
+                                if (typingSelfRef.current.timeoutId) {
+                                    clearTimeout(typingSelfRef.current.timeoutId);
+                                    typingSelfRef.current.timeoutId = null;
+                                }
+                            }
+                        }}
+                    />
+                    <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                        <button
+                            onClick={() => setChat([])}
+                            type="button"
+                            style={{ background: 'transparent', border: '1px solid #e5e7eb', padding: '8px 12px', borderRadius: 8, cursor: 'pointer' }}
+                        >
+                            Clear
+                        </button>
+                        <button
+                            onClick={sendChat}
+                            disabled={(status !== 'connected' && status !== 'recording') || chatInput.trim().length === 0}
+                            style={{ background: '#111827', color: 'white', border: '1px solid #111827', padding: '8px 12px', borderRadius: 8, cursor: 'pointer' }}
+                        >
+                            Send
+                        </button>
+                    </div>
+                </div>
+            </div>
 
             {/* Hidden container to attach remote <audio> elements for iOS/Safari */}
             <div ref={audioContainerRef} aria-hidden="true" style={{ position: 'absolute', left: -99999, width: 1, height: 1, overflow: 'hidden' }} />

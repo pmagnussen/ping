@@ -65,5 +65,26 @@ namespace Ping.Server.Hubs
             var name = Peers.TryGetValue(Context.ConnectionId, out var n) ? n : "Guest";
             return Clients.Others.SendAsync("PeerTalking", Context.ConnectionId, name, talking);
         }
+
+        // Chat
+        // Add below existing methods in AudioHub
+
+        // Chat: broadcast text messages (global)
+        public Task SendChat(string message)
+        {
+            message = (message ?? string.Empty).Trim();
+            if (string.IsNullOrEmpty(message)) return Task.CompletedTask;
+            if (message.Length > 4000) throw new HubException("Message too long");
+            var name = Peers.TryGetValue(Context.ConnectionId, out var n) ? n : "Guest";
+            // Client locally echoes its own message; broadcast to others only
+            return Clients.Others.SendAsync("ChatMessage", Context.ConnectionId, name, message, DateTimeOffset.UtcNow);
+        }
+
+        // Chat: typing indicator (debounced client-side)
+        public Task SetTyping(bool typing)
+        {
+            var name = Peers.TryGetValue(Context.ConnectionId, out var n) ? n : "Guest";
+            return Clients.Others.SendAsync("Typing", Context.ConnectionId, name, typing);
+        }
     }
 }
