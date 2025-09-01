@@ -1,0 +1,4 @@
+*.vsidx
+*.dll
+*.exe
+Ping.Server/obj/Debug/net8.0/

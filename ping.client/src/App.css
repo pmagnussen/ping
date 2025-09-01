@@ -1,8 +1,9 @@
 ﻿#root {
-    max-width: 1280px;
-    margin: 0 auto;
-    padding: 2rem;
-    text-align: center;
+    max-width: none;
+    width: 100%;
+    margin: 0;
+    padding: 0; /* optional: add e.g. 16px if you still want page padding */
+    text-align: initial; /* stop centering all text globally */
 }
 
 th, td {
