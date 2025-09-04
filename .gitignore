@@ -2,3 +2,11 @@
 *.dll
 *.exe
 Ping.Server/obj/Debug/net8.0/
+.vs/Ping/CopilotIndices/17.14.939.21063/CodeChunks.db-shm
+.vs/Ping/CopilotIndices/17.14.939.21063/CodeChunks.db-wal
+.vs/Ping/CopilotIndices/17.14.939.21063/SemanticSymbols.db-shm
+.vs/Ping/CopilotIndices/17.14.939.21063/SemanticSymbols.db-wal
+Ping.Server/obj/Ping.Server.csproj.nuget.dgspec.json
+Ping.Server/obj/Ping.Server.csproj.nuget.g.targets
+Ping.Server/obj/project.assets.json
+Ping.Server/obj/project.nuget.cache
