@@ -3,6 +3,9 @@ import type React from 'react';
 import { useVoiceChatConnection } from '../hooks/useVoiceChatConnection';
 
 export default function VoiceChat() {
+    // Track whether user has initiated PTT to defer mic initialization
+    const [micInitialized, setMicInitialized] = useState(false);
+
     const {
         status,
         name,
@@ -15,7 +18,8 @@ export default function VoiceChat() {
         stopRecording,
         sendChat,
         notifyTypingOnInput,
-    } = useVoiceChatConnection('Gestur');
+        initializeMic, // We'll need to add this to the hook
+    } = useVoiceChatConnection('Gestur', { lazyInit: true }); // Add option to defer mic initialization
 
     // PTT keyboard state
     const pttKeyDownRef = useRef(false);
@@ -23,17 +27,28 @@ export default function VoiceChat() {
     // Chat input (UI local state)
     const [chatInput, setChatInput] = useState('');
 
+    // Initialize mic only when user first attempts PTT
+    const initMicIfNeeded = useCallback(() => {
+        if (!micInitialized) {
+            setMicInitialized(true);
+            return initializeMic(); // Should return a promise
+        }
+        return Promise.resolve();
+    }, [micInitialized, initializeMic]);
+
     const handlePointerDown = useCallback((e: React.PointerEvent<HTMLButtonElement>) => {
         e.preventDefault();
-        if (status === 'connected') startRecording();
-    }, [status, startRecording]);
+        if (status === 'connected') {
+            initMicIfNeeded().then(() => startRecording());
+        }
+    }, [status, startRecording, initMicIfNeeded]);
 
     const handlePointerUpOrCancel = useCallback((e: React.PointerEvent<HTMLButtonElement>) => {
         e.preventDefault();
         if (status === 'recording') stopRecording();
     }, [status, stopRecording]);
 
-    // Keyboard PTT (ArrowDown)
+    // Keyboard PTT (ArrowDown) - modified to initialize mic when needed
     useEffect(() => {
         const isEditable = (el: Element | null) => {
             if (!el) return false;
@@ -48,7 +63,9 @@ export default function VoiceChat() {
             e.preventDefault();
             if (!pttKeyDownRef.current) {
                 pttKeyDownRef.current = true;
-                if (status === 'connected') startRecording();
+                if (status === 'connected') {
+                    initMicIfNeeded().then(() => startRecording());
+                }
             }
         };
         const onKeyUp = (e: KeyboardEvent) => {
@@ -72,7 +89,7 @@ export default function VoiceChat() {
             window.removeEventListener('blur', onBlurOrHide);
             document.removeEventListener('visibilitychange', onBlurOrHide);
         };
-    }, [startRecording, status, stopRecording]);
+    }, [startRecording, status, stopRecording, initMicIfNeeded]);
 
     // Chat handlers
     const onChatInputChanged = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
