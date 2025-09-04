@@ -88,7 +88,7 @@ const cleanupMediaStream = (stream: MediaStream | null) => {
     try {
         const tracks = stream.getTracks();
         for (const track of tracks) {
-            if (!track.stopped) {
+            if (track.readyState !== 'ended') {
                 track.stop();
             }
         }
@@ -201,7 +201,8 @@ export function useVoiceChatConnection(initialName = 'Gestur', options: VoiceCha
             // Create a silent audio track to prime the connection
             const silentCtx = new AudioContext();
             const oscillator = silentCtx.createOscillator();
-            const dst = oscillator.connect(silentCtx.createMediaStreamDestination());
+            const dst = silentCtx.createMediaStreamDestination();
+            oscillator.connect(dst);
             oscillator.start();
 
             // Get the silent track
@@ -385,14 +386,6 @@ export function useVoiceChatConnection(initialName = 'Gestur', options: VoiceCha
         }
     }, []);
 
-    // Modified to support lazy initialization
-    const ensureLocalTrack = useCallback(async (): Promise<MediaStreamTrack | null> => {
-        if (localTrackRef.current && localStreamRef.current) return localTrackRef.current;
-
-        const success = await initializeMic();
-        return success ? localTrackRef.current : null;
-    }, [initializeMic]);
-
     const flushPendingIce = useCallback(async (peerId: string, pc: RTCPeerConnection) => {
         const queued = pendingIceRef.current.get(peerId);
         if (!queued || queued.length === 0) return;
@@ -497,15 +490,14 @@ export function useVoiceChatConnection(initialName = 'Gestur', options: VoiceCha
                 el.setAttribute('autoplay', '');
                 el.setAttribute('playsinline', '');
 
-                // Special workaround for Chrome/Safari autoplay policy
                 el.onloadedmetadata = () => {
                     log(`Metadata loaded for audio from ${peerId}, trying autoplay`);
-                    el.play().catch(e => logError(`Autoplay failed for ${peerId}:`, e));
+                    el!.play().catch(e => logError(`Autoplay failed for ${peerId}:`, e)); // Fixed: added ! operator
                 };
 
                 el.oncanplay = () => {
                     log(`Can play audio from ${peerId}, attempting play`);
-                    el.play().catch(e => logError(`Canplay event play failed for ${peerId}:`, e));
+                    el!.play().catch(e => logError(`Canplay event play failed for ${peerId}:`, e)); // Fixed: added ! operator
                 };
 
                 // Add audio to document but keep it hidden
@@ -1028,7 +1020,7 @@ export function useVoiceChatConnection(initialName = 'Gestur', options: VoiceCha
         }
 
         // Stop the track and release media resources to hide indicator
-        if (track && !track.stopped) {
+        if (track && track.readyState !== 'ended') { // Fixed: use readyState instead of stopped
             track.stop();
         }
 
@@ -1048,7 +1040,7 @@ export function useVoiceChatConnection(initialName = 'Gestur', options: VoiceCha
             forcePrimeAllAudioConnections();
 
             // Clean up existing resources
-            if (localTrackRef.current && !localTrackRef.current.stopped) {
+            if (localTrackRef.current && localTrackRef.current.readyState !== 'ended') { // Fixed: use readyState instead of stopped
                 localTrackRef.current.stop();
             }
             if (localStreamRef.current) {
