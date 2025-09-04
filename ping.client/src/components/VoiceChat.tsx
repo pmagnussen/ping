@@ -19,6 +19,8 @@ export default function VoiceChat() {
         sendChat,
         notifyTypingOnInput,
         initializeMic, // We'll need to add this to the hook
+        needsAudioActivation,
+        activateAudio
     } = useVoiceChatConnection('Gestur', { lazyInit: true }); // Add option to defer mic initialization
 
     // PTT keyboard state
@@ -26,6 +28,9 @@ export default function VoiceChat() {
 
     // Chat input (UI local state)
     const [chatInput, setChatInput] = useState('');
+
+    // Modal state
+    const [showActivationModal, setShowActivationModal] = useState(needsAudioActivation);
 
     // Initialize mic only when user first attempts PTT
     const initMicIfNeeded = useCallback(() => {
@@ -107,6 +112,14 @@ export default function VoiceChat() {
             }
         }
     }, [status, chatInput, sendChat]);
+
+    // Handle audio activation
+    const handleActivateAudio = async () => {
+        const success = await activateAudio();
+        if (success) {
+            setShowActivationModal(false);
+        }
+    };
 
     return (
         <div style={{ display: 'grid', gap: 12, width: '100%', maxWidth: 'none', position: 'relative' }}>
@@ -265,6 +278,51 @@ export default function VoiceChat() {
 
             {/* Hidden container to attach remote <audio> elements for iOS/Safari */}
             <div ref={audioContainerRef} aria-hidden="true" style={{ position: 'absolute', left: -99999, width: 1, height: 1, overflow: 'hidden' }} />
+
+            {/* Audio activation modal */}
+            {showActivationModal && (
+                <div className="audio-activation-modal" style={{
+                    position: 'fixed',
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    display: 'flex',
+                    justifyContent: 'center',
+                    alignItems: 'center',
+                    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+                    zIndex: 9999
+                }}>
+                    <div className="modal-content" style={{
+                        background: 'white',
+                        borderRadius: 12,
+                        padding: 24,
+                        maxWidth: 400,
+                        width: '90%',
+                        boxShadow: '0 4px 8px rgba(0, 0, 0, 0.2)',
+                        textAlign: 'center'
+                    }}>
+                        <h2 style={{ margin: 0, fontSize: 20, fontWeight: 600, marginBottom: 16 }}>Join channel</h2>
+                        <p style={{ margin: 0, fontSize: 14, color: '#555', marginBottom: 24 }}>
+                            Click the button below to join the voice chat channel. This activates your browser's audio system.
+                        </p>
+                        <button onClick={handleActivateAudio} style={{
+                            background: '#111827',
+                            color: 'white',
+                            border: 'none',
+                            padding: '10px 20px',
+                            borderRadius: 8,
+                            cursor: 'pointer',
+                            fontSize: 16,
+                            fontWeight: 500,
+                            transition: 'background 0.3s',
+                            width: '100%'
+                        }}>
+                            Join Now
+                        </button>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
