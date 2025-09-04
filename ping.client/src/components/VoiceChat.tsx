@@ -123,20 +123,21 @@ export default function VoiceChat() {
 
     return (
         <div style={{ display: 'grid', gap: 12, width: '100%', maxWidth: 'none', position: 'relative' }}>
-            <h2>Trýst og tosa</h2>
-
-            {activeSpeaker && (
-                <div role="status" aria-live="polite" style={{
-                    display: 'inline-flex', alignItems: 'center', gap: 8, padding: '6px 10px',
-                    borderRadius: 999, background: '#eef6ff', color: '#0b5cab', width: 'fit-content'
-                }}>
-                    <span style={{
-                        width: 8, height: 8, borderRadius: 999, background: '#2ecc71',
-                        boxShadow: '0 0 0 3px rgba(46,204,113,0.25)'
-                    }} />
-                    <span>{activeSpeaker} tosar…</span>
-                </div>
-            )}
+            <div className="heading-container" style={{ display: 'flex', alignItems: 'center' }}>
+                <h2>Trýst og tosa</h2>
+                {activeSpeaker && (
+                    <div className="speaker-indicator" style={{ 
+                        marginLeft: '1rem', 
+                        color: 'green',
+                        fontWeight: 'bold',
+                        height: '24px',
+                        display: 'flex',
+                        alignItems: 'center'
+                    }}>
+                        {activeSpeaker} tosar
+                    </div>
+                )}
+            </div>
 
             <label style={{ display: 'grid', gap: 6 }}>
                 <span>Mítt navn</span>

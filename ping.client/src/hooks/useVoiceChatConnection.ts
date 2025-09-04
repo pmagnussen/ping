@@ -18,9 +18,7 @@ export interface VoiceChatOptions {
 
 type PeerInfo = { ConnectionId: string; Name: string };
 
-const HUB_URL =
-  (import.meta as any).env?.VITE_SIGNALR_HUB
-  || (import.meta.env.PROD ? 'https://ping.vera.fo/api/voice' : 'https://localhost:7160/voice');
+const HUB_URL = 'https://ping.vera.fo/api/voice';
 
 // WebRTC ICE config
 const DEFAULT_PUBLIC_STUNS: RTCIceServer[] = [
@@ -73,26 +71,6 @@ const forcePrimeAllAudioConnections = () => {
         log('Played local priming tone');
     } catch (err) {
         logError('Failed to play local priming tone:', err);
-    }
-
-    // 2. Add a persistent button if needed
-    if (!document.getElementById('wake-audio-btn')) {
-        const btn = document.createElement('button');
-        btn.id = 'wake-audio-btn';
-        btn.textContent = 'Wake Audio System';
-        btn.style.position = 'fixed';
-        btn.style.bottom = '50px';
-        btn.style.right = '50px';
-        btn.style.padding = '10px';
-        btn.style.zIndex = '9999';
-        btn.style.backgroundColor = '#ff9800';
-        btn.onclick = () => {
-            // Play a tone when clicked
-            playDirectSound();
-            btn.textContent = 'Audio System Awakened';
-            setTimeout(() => btn.remove(), 2000);
-        };
-        document.body.appendChild(btn);
     }
 
     // 3. Force play any existing audio elements
@@ -200,46 +178,15 @@ const playDirectSound = () => {
 export function useVoiceChatConnection(initialName = 'Gestur', options: VoiceChatOptions = {}) {
   const { lazyInit = false } = options;
   
-  // Add this right at the beginning of your hook
+  // Modify this part of the hook
   useEffect(() => {
-    // Check if we've shown the activation modal before
-    const audioActivated = localStorage.getItem('audioActivated');
-    
-    if (!audioActivated) {
-      // First visit, show the modal
-      createAudioActivationModal();
-    } else {
-      // Already activated before, just prime the audio system
-      try {
-        const ctx = new AudioContext();
-        ctx.resume().catch(() => {});
-        
-        // Still create a button to activate audio, but smaller and in the corner
-        const btn = document.createElement('button');
-        btn.textContent = '🔊';
-        btn.title = 'Activate Audio System';
-        btn.style.position = 'fixed';
-        btn.style.bottom = '20px';
-        btn.style.right = '20px';
-        btn.style.padding = '10px';
-        btn.style.zIndex = '9999';
-        btn.style.backgroundColor = '#f0f0f0';
-        btn.style.border = 'none';
-        btn.style.borderRadius = '50%';
-        btn.style.cursor = 'pointer';
-        btn.style.boxShadow = '0 2px 5px rgba(0,0,0,0.2)';
-        
-        btn.onclick = () => {
-          playDirectSound();
-          btn.textContent = '✓';
-          btn.style.backgroundColor = '#4CAF50';
-          setTimeout(() => btn.remove(), 2000);
-        };
-        
-        document.body.appendChild(btn);
-      } catch (err) {
-        logError('Failed to initialize audio system:', err);
-      }
+    // We no longer check localStorage - we'll always initialize silently
+    // but still show the join button on every page load
+    try {
+      const ctx = new AudioContext();
+      ctx.resume().catch(() => {});
+    } catch (err) {
+      logError('Failed to initialize audio system:', err);
     }
   }, []);
   
@@ -562,15 +509,21 @@ export function useVoiceChatConnection(initialName = 'Gestur', options: VoiceCha
               log(`Explicitly enabled remote track from ${peerId}`);
           }
 
-          // Create a loud, visible audio element
+          // Create an invisible audio element
           let el = remoteAudiosRef.current.get(peerId);
           if (!el) {
               el = new Audio();
               el.id = `audio-${peerId}`;
               el.autoplay = true;
-              el.controls = true;
+              // Remove controls to make it invisible
+              el.controls = false; 
               el.muted = false; 
               el.volume = 1.0; 
+              
+              // Make sure it's completely hidden
+              el.style.display = 'none';
+              el.style.width = '0';
+              el.style.height = '0';
               
               el.setAttribute('autoplay', '');
               el.setAttribute('playsinline', '');
@@ -586,22 +539,12 @@ export function useVoiceChatConnection(initialName = 'Gestur', options: VoiceCha
                 el.play().catch(e => logError(`Canplay event play failed for ${peerId}:`, e));
               };
 
-              // Add audio to document
+              // Add audio to document but keep it hidden
               document.body.appendChild(el);
-              log(`Created visible audio element for ${peerId}`);
+              log(`Created hidden audio element for ${peerId}`);
 
-              // Add an indicator to show the element exists
-              const indicator = document.createElement('div');
-              indicator.textContent = `Audio from ${peerNamesRef.current.get(peerId) || peerId}`;
-              indicator.style.position = 'fixed';
-              indicator.style.bottom = '10px';
-              indicator.style.left = '10px';
-              indicator.style.padding = '5px';
-              indicator.style.backgroundColor = 'green';
-              indicator.style.color = 'white';
-              indicator.style.zIndex = '10000';
-              document.body.appendChild(indicator);
-
+              // No longer creating the visual indicator
+              
               remoteAudiosRef.current.set(peerId, el);
           }
 
@@ -616,30 +559,6 @@ export function useVoiceChatConnection(initialName = 'Gestur', options: VoiceCha
                   })
                   .catch(err => {
                       logError(`❌ Failed to play audio from ${peerId}:`, err);
-
-                      // Create a very visible play button
-                      const btn = document.createElement('button');
-                      btn.textContent = `CLICK TO ENABLE AUDIO from ${peerNamesRef.current.get(peerId)}`;
-                      btn.style.position = 'fixed';
-                      btn.style.top = '50%';
-                      btn.style.left = '50%';
-                      btn.style.transform = 'translate(-50%, -50%)';
-                      btn.style.padding = '20px';
-                      btn.style.backgroundColor = 'red';
-                      btn.style.color = 'white';
-                      btn.style.fontSize = '24px';
-                      btn.style.zIndex = '99999';
-
-                      btn.onclick = () => {
-                          // Try different approaches to get audio playing
-                          playDirectSound(); // Wake up audio context
-                          el.muted = false;
-                          el.volume = 1.0;
-                          el.play().catch(console.error);
-                          btn.remove();
-                      };
-
-                      document.body.appendChild(btn);
                   });
           };
 
@@ -1186,55 +1105,8 @@ export function useVoiceChatConnection(initialName = 'Gestur', options: VoiceCha
     return () => window.removeEventListener('keydown', handleKeyPress);
   }, [forceTestSound, debugAudioPipeline]);
 
-  // Modify the createAudioActivationModal function
-const createAudioActivationModal = () => {
-  // Only create if it doesn't exist already
-  if (document.getElementById('audio-activation-modal')) return;
-  
-  // Create the modal container
-  const modal = document.createElement('div');
-  modal.id = 'audio-activation-modal';
-  modal.style.position = 'fixed';
-  modal.style.top = '0';
-  modal.style.left = '0';
-  modal.style.width = '100%';
-  modal.style.height = '100%';
-  modal.style.backgroundColor = 'rgba(0,0,0,0.8)';
-  modal.style.zIndex = '99999';
-  modal.style.display = 'flex';
-  modal.style.alignItems = 'center';
-  modal.style.justifyContent = 'center';
-  
-  // Create the content box
-  const box = document.createElement('div');
-  box.style.padding = '25px';
-  box.style.backgroundColor = 'white';
-  box.style.borderRadius = '8px';
-  box.style.maxWidth = '350px'; // Slightly smaller
-  box.style.textAlign = 'center';
-  
-  const heading = document.createElement('h2');
-  heading.textContent = 'Join channel'; // Updated title
-  heading.style.margin = '0 0 15px 0';
-  
-  const text = document.createElement('p');
-  text.textContent = 'Click the button below to join the voice chat channel. This activates your browser\'s audio system.';
-  text.style.fontSize = '14px';
-  text.style.lineHeight = '1.4';
-  
-  const button = document.createElement('button');
-  button.textContent = 'Join Now';
-  button.style.padding = '10px 20px'; // Smaller padding
-  button.style.fontSize = '16px'; // Smaller font size
-  button.style.margin = '15px 0 5px 0';
-  button.style.backgroundColor = '#4CAF50';
-  button.style.color = 'white';
-  button.style.border = 'none';
-  button.style.borderRadius = '4px';
-  button.style.cursor = 'pointer';
-  
-  // When clicked, activate audio and remove modal
-  button.onclick = () => {
+  // Replace the createAudioActivationModal function with this:
+  const activateAudioSystem = async (): Promise<boolean> => {
     try {
       // Play a silent sound to activate audio
       const ctx = new AudioContext();
@@ -1245,39 +1117,28 @@ const createAudioActivationModal = () => {
       gainNode.gain.value = 0.01; // Almost silent
       oscillator.start();
       
-      setTimeout(() => {
+      // Wait a bit
+      await new Promise(resolve => setTimeout(() => {
         oscillator.stop();
-        // Remove modal
-        modal.style.transition = 'opacity 0.5s';
-        modal.style.opacity = '0';
-        setTimeout(() => modal.remove(), 500);
-        
-        // Set a flag in localStorage to remember this activation
-        localStorage.setItem('audioActivated', 'true');
-        
-        // Try to request microphone permission early
-        navigator.mediaDevices.getUserMedia({ audio: true })
-          .then(stream => {
-            log('Microphone permission granted');
-            // Stop tracks to release microphone
-            stream.getTracks().forEach(track => track.stop());
-          })
-          .catch(err => logError('Microphone permission request failed:', err));
-        
-      }, 200);
+        resolve(null);
+      }, 200));
+      
+      // Request microphone permission early
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        log('Microphone permission granted');
+        // Stop tracks to release microphone
+        stream.getTracks().forEach(track => track.stop());
+      } catch (micErr) {
+        logError('Microphone permission request failed:', micErr);
+      }
+      
+      return true;
     } catch (err) {
-      logError('Failed to activate audio:', err);
-      modal.remove();
+      logError('Failed to activate audio system:', err);
+      return false;
     }
   };
-  
-  // Assemble and add to document
-  box.appendChild(heading);
-  box.appendChild(text);
-  box.appendChild(button);
-  modal.appendChild(box);
-  document.body.appendChild(modal);
-};
 
   return {
     // state
@@ -1298,6 +1159,17 @@ const createAudioActivationModal = () => {
     // Debug functions
     __debug_forceTestSound: forceTestSound,
     __debug_audioPipeline: debugAudioPipeline,
-    __debug_playSound: playDirectSound
+    __debug_playSound: playDirectSound,
+
+    // Add these:
+    needsAudioActivation: true,
+    activateAudio: async () => {
+      const success = await activateAudioSystem();
+      if (success) {
+        // Still save to localStorage (could be useful for analytics)
+        localStorage.setItem('audioActivated', 'true');
+      }
+      return success;
+    }
   };
 }
