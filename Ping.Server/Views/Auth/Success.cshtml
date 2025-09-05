@@ -1,0 +1,134 @@
+﻿@model Ping.Server.Controllers.SuccessViewModel
+
+@{
+    ViewData["Title"] = "Welcome";
+}
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>@ViewData["Title"] - Ping</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f9fafb;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            background: white;
+            border-radius: 12px;
+            padding: 2rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            width: 100%;
+            max-width: 400px;
+            text-align: center;
+        }
+
+        h1 {
+            font-size: 1.875rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            color: #111827;
+        }
+
+        .email {
+            font-weight: 600;
+            color: #111827;
+        }
+
+        p {
+            color: #6b7280;
+            line-height: 1.6;
+            margin-bottom: 1.5rem;
+        }
+
+        .app-link {
+            display: inline-block;
+            background-color: #111827;
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 500;
+            margin-bottom: 1rem;
+        }
+
+            .app-link:hover {
+                background-color: #1f2937;
+            }
+
+        .sign-out {
+            color: #6b7280;
+            text-decoration: none;
+            font-size: 0.875rem;
+        }
+
+            .sign-out:hover {
+                text-decoration: underline;
+            }
+
+        .success-icon {
+            font-size: 3rem;
+            color: #10b981;
+            margin-bottom: 1rem;
+        }
+
+        .loading {
+            color: #6b7280;
+            font-size: 0.875rem;
+        }
+
+        .oidc-info {
+            background: #f0f9ff;
+            border: 1px solid #0ea5e9;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1.5rem;
+            font-size: 0.875rem;
+        }
+
+        .oidc-info h3 {
+            margin: 0 0 0.5rem 0;
+            color: #0369a1;
+        }
+
+        .oidc-info p {
+            margin: 0;
+            color: #0c4a6e;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="success-icon">✅</div>
+        <h1>Welcome!</h1>
+        <p>
+            You're now signed in as <span class="email">@Model.Email</span>.
+        </p>
+
+        <div class="oidc-info">
+            <h3>🔐 OpenID Connect Ready</h3>
+            <p>This server can now authenticate users for other applications using OpenID Connect.</p>
+        </div>
+
+        <a href="/" class="app-link">Go to Voice Chat</a>
+        <br>
+        <a href="/auth/signout" class="sign-out">Sign out</a>
+    </div>
+
+    <script>
+        // Auto-redirect after 5 seconds
+        setTimeout(() => {
+            window.location.href = '/';
+        }, 5000);
+    </script>
+</body>
+</html>

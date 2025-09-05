@@ -1,0 +1,192 @@
+﻿@model Ping.Server.Controllers.VerifyCodeViewModel
+
+@{
+    ViewData["Title"] = "Verify Code";
+}
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>@ViewData["Title"] - Ping</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f9fafb;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            background: white;
+            border-radius: 12px;
+            padding: 2rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            width: 100%;
+            max-width: 400px;
+        }
+
+        h1 {
+            font-size: 1.875rem;
+            font-weight: 600;
+            text-align: center;
+            margin-bottom: 1rem;
+            color: #111827;
+        }
+
+        .description {
+            text-align: center;
+            margin-bottom: 2rem;
+            color: #6b7280;
+            font-size: 0.875rem;
+            line-height: 1.5;
+        }
+
+        .email-highlight {
+            font-weight: 600;
+            color: #111827;
+        }
+
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        label {
+            display: block;
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: #374151;
+            margin-bottom: 0.5rem;
+        }
+
+        input[type="text"] {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 1.25rem;
+            text-align: center;
+            letter-spacing: 0.5rem;
+            outline: none;
+            transition: border-color 0.2s;
+            box-sizing: border-box;
+            font-family: 'Courier New', monospace;
+        }
+
+            input[type="text"]:focus {
+                border-color: #3b82f6;
+            }
+
+        .error {
+            color: #dc2626;
+            font-size: 0.875rem;
+            margin-top: 0.25rem;
+        }
+
+        button {
+            width: 100%;
+            padding: 0.75rem 1.5rem;
+            background-color: #111827;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+            button:hover {
+                background-color: #1f2937;
+            }
+
+            button:disabled {
+                background-color: #9ca3af;
+                cursor: not-allowed;
+            }
+
+        .resend-link {
+            text-align: center;
+            margin-top: 1rem;
+        }
+
+            .resend-link a {
+                color: #3b82f6;
+                text-decoration: none;
+                font-size: 0.875rem;
+            }
+
+                .resend-link a:hover {
+                    text-decoration: underline;
+                }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Enter Verification Code</h1>
+        <p class="description">
+            We've sent a 6-digit verification code to <span class="email-highlight">@Model.Email</span>.
+            Enter the code below to continue.
+        </p>
+
+        <form method="post" action="/auth/verify-code@(string.IsNullOrEmpty(Model.ReturnUrl) ? "" : $"?returnUrl={Uri.EscapeDataString(Model.ReturnUrl)}")">
+            <input type="hidden" name="Email" value="@Model.Email" />
+
+            <div class="form-group">
+                <label for="Code">Verification Code</label>
+                <input type="text"
+                       id="Code"
+                       name="Code"
+                       placeholder="123456"
+                       maxlength="6"
+                       pattern="[0-9]{6}"
+                       inputmode="numeric"
+                       autocomplete="one-time-code"
+                       required />
+                @if (Html.ViewData.ModelState["Code"]?.Errors?.Count > 0)
+                {
+                    <div class="error">
+                        @Html.ValidationMessage("Code")
+                    </div>
+                }
+                @if (Html.ViewData.ModelState[""]?.Errors?.Count > 0)
+                {
+                    <div class="error">
+                        @Html.ValidationMessage("")
+                    </div>
+                }
+            </div>
+
+            <button type="submit">Verify Code</button>
+        </form>
+
+        <div class="resend-link">
+            <a href="/auth/signin@(string.IsNullOrEmpty(Model.ReturnUrl) ? "" : $"?returnUrl={Uri.EscapeDataString(Model.ReturnUrl)}")">
+                Send a new code
+            </a>
+        </div>
+    </div>
+
+    <script>
+        // Auto-format the code input
+        const codeInput = document.getElementById('Code');
+        codeInput.addEventListener('input', function(e) {
+            // Only allow numbers
+            e.target.value = e.target.value.replace(/[^0-9]/g, '');
+
+            // Auto-submit when 6 digits are entered
+            if (e.target.value.length === 6) {
+                e.target.form.submit();
+            }
+        });
+
+        // Focus the input on page load
+        codeInput.focus();
+    </script>
+</body>
+</html>
