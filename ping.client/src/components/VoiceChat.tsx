@@ -1,15 +1,19 @@
 ﻿import { useCallback, useEffect, useRef, useState } from 'react';
 import type React from 'react';
 import { useVoiceChatConnection } from '../hooks/useVoiceChatConnection';
+import { useAuth } from '../hooks/useAuth';
 
 export default function VoiceChat() {
+    // Get authenticated user data
+    const { user } = useAuth();
+    
     // Track whether user has initiated PTT to defer mic initialization
     const [micInitialized, setMicInitialized] = useState(false);
 
     const {
         status,
         name,
-        setName,
+        setName, // Keep this for internal functionality
         activeSpeaker,
         chat,
         typingNames,
@@ -18,10 +22,17 @@ export default function VoiceChat() {
         stopRecording,
         sendChat,
         notifyTypingOnInput,
-        initializeMic, // We'll need to add this to the hook
+        initializeMic,
         needsAudioActivation,
         activateAudio
-    } = useVoiceChatConnection('Gestur', { lazyInit: true }); // Add option to defer mic initialization
+    } = useVoiceChatConnection(user?.name || 'Gestur', { lazyInit: true });
+
+    // Set the name to the authenticated user's name when user data becomes available
+    useEffect(() => {
+        if (user?.name && name !== user.name) {
+            setName(user.name);
+        }
+    }, [user?.name, name, setName]);
 
     // PTT keyboard state
     const pttKeyDownRef = useRef(false);
@@ -36,7 +47,7 @@ export default function VoiceChat() {
     const initMicIfNeeded = useCallback(() => {
         if (!micInitialized) {
             setMicInitialized(true);
-            return initializeMic(); // Should return a promise
+            return initializeMic();
         }
         return Promise.resolve();
     }, [micInitialized, initializeMic]);
@@ -139,15 +150,6 @@ export default function VoiceChat() {
                 )}
             </div>
 
-            <label style={{ display: 'grid', gap: 6 }}>
-                <span>Mítt navn</span>
-                <input
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    placeholder="Gestur"
-                />
-            </label>
-
             <button
                 onPointerDown={handlePointerDown}
                 onPointerUp={handlePointerUpOrCancel}
@@ -199,7 +201,7 @@ export default function VoiceChat() {
                 <div role="log" aria-live="polite" style={{ overflowY: 'auto', maxHeight: 320, paddingRight: 4 }}>
                     <div>
                         {chat.map(m => {
-                            const mine = m.fromId && (m.fromId === (undefined as any)); // UI does not need connectionId; style all uniformly
+                            const mine = m.fromId && (m.fromId === (undefined as any));
                             return (
                                 <div key={m.id} style={{
                                     display: 'grid',

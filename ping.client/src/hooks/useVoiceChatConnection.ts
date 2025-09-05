@@ -1,6 +1,7 @@
 ﻿import { useCallback, useEffect, useRef, useState } from 'react';
 import * as signalR from '@microsoft/signalr';
 import { MessagePackHubProtocol } from '@microsoft/signalr-protocol-msgpack';
+import { useAuth } from './useAuth';
 
 export type Status = 'idle' | 'connecting' | 'connected' | 'recording';
 export type ChatItem = {
@@ -18,7 +19,7 @@ export interface VoiceChatOptions {
 
 type PeerInfo = { ConnectionId: string; Name: string };
 
-const HUB_URL = 'https://ping.vera.fo/api/voice';
+const HUB_URL = '/voice'; // Use relative URL since it's same origin
 
 // WebRTC ICE config
 const DEFAULT_PUBLIC_STUNS: RTCIceServer[] = [
@@ -172,7 +173,8 @@ const playDirectSound = () => {
 
 export function useVoiceChatConnection(initialName = 'Gestur', options: VoiceChatOptions = {}) {
     const { lazyInit = false } = options;
-
+    const { accessToken, isAuthenticated } = useAuth();
+    
     // Modify this part of the hook
     useEffect(() => {
         // We no longer check localStorage - we'll always initialize silently
@@ -788,12 +790,20 @@ export function useVoiceChatConnection(initialName = 'Gestur', options: VoiceCha
     // Connection bootstrap + handlers
     useEffect(() => {
         if (hubRef.current) return;
+        if (!isAuthenticated || !accessToken) {
+            console.log('🔍 VoiceChat: Not authenticated, skipping hub connection');
+            return; // Don't connect if not authenticated
+        }
+
+        console.log('🔍 VoiceChat: Starting authenticated SignalR connection...');
 
         hubRef.current = new signalR.HubConnectionBuilder()
             .withUrl(HUB_URL, {
                 transport: signalR.HttpTransportType.WebSockets,
                 skipNegotiation: true,
                 withCredentials: true,
+                // 🎯 Add the access token as query parameter
+                accessTokenFactory: () => accessToken || '',
             })
             .withHubProtocol(new MessagePackHubProtocol())
             .withAutomaticReconnect()
@@ -979,7 +989,7 @@ export function useVoiceChatConnection(initialName = 'Gestur', options: VoiceCha
             typingMapRef.current.clear();
             setTypingNames([]);
         };
-    }, [applyAnswer, applyIce, makeAnswer, makeOffer, addChatItem, setTypingForPeer, clearTypingForPeer]);
+    }, [applyAnswer, applyIce, makeAnswer, makeOffer, addChatItem, setTypingForPeer, clearTypingForPeer, isAuthenticated, accessToken]); // 🎯 Add dependencies
 
     // Exposed actions
     const setName = useCallback((value: string) => {

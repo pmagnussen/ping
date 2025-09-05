@@ -46,10 +46,14 @@ export default defineConfig({
         }
     },
     server: {
-        host: true, // listen on all interfaces
+        host: 'localhost', // Changed from `true` to avoid permission issues
         proxy: {
             '^/weatherforecast': { target, secure: false },
-            '^/voice': { target, secure: false, ws: true, changeOrigin: true }, // proxy SignalR hub
+            '^/voice': { target, secure: false, ws: true, changeOrigin: true },
+            '^/signin': { target, secure: false }, // Add signin proxy
+            '^/verify-code': { target, secure: false }, // Add verify-code proxy  
+            '^/auth': { target, secure: false }, // Add auth proxy
+            '^/connect': { target, secure: false }, // Add OIDC connect proxy
         },
         port: parseInt(env.DEV_SERVER_PORT || '51520'),
         https: {
